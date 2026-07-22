@@ -30,51 +30,52 @@ const (
 )
 
 type interopScenario struct {
-	Name                    string
-	Stage                   interopStage
-	Direction               interopDirection
-	Current                 interopCurrentState
-	SkipReason              string
-	Protocol                string
-	Mode                    string
-	Cipher                  string
-	Auth                    string
-	DataCiphers             []string
-	PeerDataCiphers         []string
-	UseAuthUserPass         bool
-	UseTLSAuth              bool
-	UseTLSCrypt             bool
-	UseTLSCryptV2           bool
-	TLSCryptV2ForceCookie   bool
-	StaticKeyDirectionless  bool
-	RouteNoPull             bool
-	PullFilters             []openvpn.PullFilter
-	AdditionalPushLines     []string
-	RenegotiationInterval   time.Duration
-	RenegotiationPackets    uint64
-	ClientPingInterval      time.Duration
-	ServerPingExit          time.Duration
-	InitialIdle             time.Duration
-	Compression             string
-	CompressionLZO          string
-	AllowCompression        string
-	Fragment                uint32
-	MSSFix                  uint32
-	ExpectedMSS             uint16
-	PushConfiguration       openvpn.TunnelConfiguration
-	ExpectedConfiguration   openvpn.TunnelConfiguration
-	CheckPingTimeoutAction  bool
-	ExpectEcho              bool
-	EchoPayloadSize         int
-	ExpectGenerationChange  bool
-	ExpectStartErrorContain string
-	ExpectClientLogContains []string
-	ExpectServerLogContains []string
-	RealClientChecks        []string
-	Covers                  []string
-	LegacyServerMatrix      bool
-	MinOpenVPN              string
-	MaxOpenVPN              string
+	Name                         string
+	Stage                        interopStage
+	Direction                    interopDirection
+	Current                      interopCurrentState
+	SkipReason                   string
+	Protocol                     string
+	Mode                         string
+	Cipher                       string
+	Auth                         string
+	DataCiphers                  []string
+	PeerDataCiphers              []string
+	UseAuthUserPass              bool
+	UseTLSAuth                   bool
+	UseTLSCrypt                  bool
+	UseTLSCryptV2                bool
+	TLSCryptV2ForceCookie        bool
+	StaticKeyDirectionless       bool
+	RouteNoPull                  bool
+	PullFilters                  []openvpn.PullFilter
+	AdditionalPushLines          []string
+	RenegotiationInterval        time.Duration
+	RenegotiationPackets         uint64
+	ClientPingInterval           time.Duration
+	ServerPingExit               time.Duration
+	InitialIdle                  time.Duration
+	Compression                  string
+	CompressionLZO               string
+	AllowCompression             string
+	Fragment                     uint32
+	MSSFix                       uint32
+	ExpectedMSS                  uint16
+	PushConfiguration            openvpn.TunnelConfiguration
+	ExpectedConfiguration        openvpn.TunnelConfiguration
+	CheckPingTimeoutAction       bool
+	ExpectEcho                   bool
+	EchoPayloadSize              int
+	ExpectGenerationChange       bool
+	ExpectStartErrorContain      string
+	ExpectClientLogContains      []string
+	ExpectServerLogContains      []string
+	ExpectedClientDNSEnvironment []string
+	RealClientChecks             []string
+	Covers                       []string
+	LegacyServerMatrix           bool
+	MinOpenVPN                   string
+	MaxOpenVPN                   string
 }
 
 var openVPNInteropScenarios = []interopScenario{
@@ -398,6 +399,87 @@ var openVPNInteropScenarios = []interopScenario{
 			"route",
 			"dhcp_option",
 			"redirect_gateway",
+		},
+	},
+	{
+		Name:      "tls_udp4_client_to_real_server_modern_dns_overrides_legacy",
+		Stage:     interopStageP1,
+		Direction: interopDirectionClientToRealServer,
+		Current:   interopCurrentPass,
+		Protocol:  "udp4",
+		Mode:      "tls",
+		AdditionalPushLines: []string{
+			"dns search-domains modern-search.example",
+			"dns server 2 address 198.51.100.2:5353",
+			"dns server 2 resolve-domains low.example",
+			"dns server 2 dnssec optional",
+			"dns server 2 transport DoT",
+			"dns server 2 sni dns.low.example",
+			"dns server 10 address 198.51.100.10",
+			"dns server 10 resolve-domains high.example",
+			"dns server 10 transport DoH",
+			"dns server 10 sni dns.high.example",
+			"dhcp-option DNS 192.0.2.53",
+			"dhcp-option DOMAIN legacy.example",
+			"dhcp-option DOMAIN-SEARCH legacy-search.example",
+			"dhcp-option DOMAIN-ROUTE legacy-route.example",
+			"dhcp-option WINS 192.0.2.54",
+		},
+		ExpectedConfiguration: openvpn.TunnelConfiguration{
+			DNS: []netip.Addr{
+				netip.MustParseAddr("198.51.100.2"),
+				netip.MustParseAddr("198.51.100.10"),
+			},
+			DNSServers: []openvpn.TunnelDNSServer{
+				{
+					Priority:       2,
+					Addresses:      []netip.AddrPort{netip.MustParseAddrPort("198.51.100.2:5353")},
+					ResolveDomains: []string{"low.example"},
+					DNSSEC:         "optional",
+					Transport:      "dot",
+					SNI:            "dns.low.example",
+				},
+				{
+					Priority:       10,
+					Addresses:      []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("198.51.100.10"), 0)},
+					ResolveDomains: []string{"high.example"},
+					Transport:      "doh",
+					SNI:            "dns.high.example",
+				},
+			},
+			SearchDomains: []string{"modern-search.example"},
+			DNSRoutes:     []string{},
+			DHCPOptions:   []string{"WINS 192.0.2.54"},
+		},
+		ExpectEcho: true,
+		MinOpenVPN: "2.6",
+		Covers: []string{
+			"modern_dns_client",
+			"modern_dns_overrides_legacy",
+		},
+	},
+	{
+		Name:      "tls_udp4_client_to_real_server_modern_dns_search_only_keeps_legacy",
+		Stage:     interopStageP1,
+		Direction: interopDirectionClientToRealServer,
+		Current:   interopCurrentPass,
+		Protocol:  "udp4",
+		Mode:      "tls",
+		AdditionalPushLines: []string{
+			"dns search-domains modern.example",
+			"dhcp-option DNS 192.0.2.60",
+			"dhcp-option DOMAIN legacy.example",
+		},
+		ExpectedConfiguration: openvpn.TunnelConfiguration{
+			DNS:           []netip.Addr{netip.MustParseAddr("192.0.2.60")},
+			DHCPOptions:   []string{"DNS 192.0.2.60", "DOMAIN legacy.example"},
+			SearchDomains: []string{"modern.example", "legacy.example"},
+		},
+		ExpectEcho: true,
+		MinOpenVPN: "2.6",
+		Covers: []string{
+			"modern_dns_search_domains",
+			"modern_dns_search_only_legacy_fallback",
 		},
 	},
 	{
@@ -742,6 +824,55 @@ var openVPNInteropScenarios = []interopScenario{
 			"dhcp-option DNS6 2001:4860:4860::8888",
 		},
 		Covers: []string{"push_dns", "typed_push_dns", "p0_real_client_to_repo_server"},
+	},
+	{
+		Name:      "tls_udp4_real_client_to_repo_server_modern_dns",
+		Stage:     interopStageP1,
+		Direction: interopDirectionRealClientToServer,
+		Current:   interopCurrentPass,
+		Protocol:  "udp4",
+		Mode:      "tls",
+		PushConfiguration: openvpn.TunnelConfiguration{
+			DNSServers: []openvpn.TunnelDNSServer{
+				{
+					Priority:       10,
+					Addresses:      []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("198.51.100.10"), 0)},
+					ResolveDomains: []string{"high.example"},
+					DNSSEC:         "no",
+					Transport:      "doh",
+					SNI:            "dns.high.example",
+				},
+				{
+					Priority:       2,
+					Addresses:      []netip.AddrPort{netip.MustParseAddrPort("198.51.100.2:5353")},
+					ResolveDomains: []string{"low.example"},
+					DNSSEC:         "optional",
+					Transport:      "dot",
+					SNI:            "dns.low.example",
+				},
+			},
+			SearchDomains: []string{"modern-search.example"},
+		},
+		ExpectedClientDNSEnvironment: []string{
+			"dns_search_domain_1=modern-search.example",
+			"dns_server_1_address_1=198.51.100.2",
+			"dns_server_1_dnssec=optional",
+			"dns_server_1_port_1=5353",
+			"dns_server_1_resolve_domain_1=low.example",
+			"dns_server_1_sni=dns.low.example",
+			"dns_server_1_transport=DoT",
+			"dns_server_2_address_1=198.51.100.10",
+			"dns_server_2_dnssec=no",
+			"dns_server_2_resolve_domain_1=high.example",
+			"dns_server_2_sni=dns.high.example",
+			"dns_server_2_transport=DoH",
+		},
+		ExpectEcho: true,
+		MinOpenVPN: "2.6",
+		Covers: []string{
+			"modern_dns_server",
+			"modern_dns_real_client_environment",
+		},
 	},
 	{
 		Name:                   "tls_udp4_real_client_to_repo_server_renegotiation",

@@ -155,6 +155,7 @@ type tlsClientTemplateData struct {
 	CompressionLZO       string
 	RenegotiationSeconds int64
 	AuthFilePath         string
+	UpScriptPath         string
 	RouteNoPull          bool
 	LogPath              string
 	ExplicitNotify       bool

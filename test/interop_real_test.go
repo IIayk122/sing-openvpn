@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -529,8 +530,17 @@ func assertExpectedTunnelConfiguration(t *testing.T, scenario interopScenario, o
 	if expected.DNS != nil && !slices.Equal(actual.DNS, expected.DNS) {
 		t.Fatalf("expected pushed DNS addresses %v, got %v", expected.DNS, actual.DNS)
 	}
+	if expected.DNSServers != nil && !reflect.DeepEqual(actual.DNSServers, expected.DNSServers) {
+		t.Fatalf("expected pushed DNS servers %+v, got %+v", expected.DNSServers, actual.DNSServers)
+	}
 	if expected.DHCPOptions != nil && !slices.Equal(actual.DHCPOptions, expected.DHCPOptions) {
 		t.Fatalf("expected pushed DHCP options %v, got %v", expected.DHCPOptions, actual.DHCPOptions)
+	}
+	if expected.SearchDomains != nil && !slices.Equal(actual.SearchDomains, expected.SearchDomains) {
+		t.Fatalf("expected pushed DNS search domains %v, got %v", expected.SearchDomains, actual.SearchDomains)
+	}
+	if expected.DNSRoutes != nil && !slices.Equal(actual.DNSRoutes, expected.DNSRoutes) {
+		t.Fatalf("expected pushed DNS routes %v, got %v", expected.DNSRoutes, actual.DNSRoutes)
 	}
 	if expected.RedirectGateway && !actual.RedirectGateway {
 		t.Fatal("expected pushed redirect-gateway to be retained")
@@ -665,6 +675,9 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 		Push: openvpn.ServerPushOptions{
 			Routes:          tunnelRoutePrefixes(pushConfiguration.IPv4Routes, pushConfiguration.IPv6Routes),
 			DNS:             slices.Clone(pushConfiguration.DNS),
+			DNSServers:      slices.Clone(pushConfiguration.DNSServers),
+			SearchDomains:   slices.Clone(pushConfiguration.SearchDomains),
+			DHCPOptions:     slices.Clone(pushConfiguration.DHCPOptions),
 			RedirectGateway: pushConfiguration.RedirectGateway,
 		},
 		KeyDirection: 0,
@@ -723,6 +736,7 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 	if len(scenario.PeerDataCiphers) > 0 {
 		clientDataCiphers = scenario.PeerDataCiphers
 	}
+	clientUpScriptPath := dockerPathIf(len(scenario.ExpectedClientDNSEnvironment) > 0, "scripts", "capture_dns_env.sh")
 	renderInteropTemplate(t, "tls-client.conf.tmpl", filepath.Join(workspace.renderedDir, "client-tls.conf"), tlsClientTemplateData{
 		Protocol:             scenario.Protocol,
 		RemoteHost:           "host.docker.internal",
@@ -738,6 +752,7 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 		DataCiphersDirective: "data-ciphers",
 		DataCiphers:          strings.Join(clientDataCiphers, ":"),
 		AuthFilePath:         clientAuthPath,
+		UpScriptPath:         clientUpScriptPath,
 		LogPath:              filepath.ToSlash(filepath.Join(openVPNInteropRoot, "logs", "client.log")),
 	})
 	if scenario.ExpectStartErrorContain != "" {
@@ -804,6 +819,17 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 		t.Fatalf("real client container failed: %s", waitResult.Logs)
 	}
 	assertLogContains(t, filepath.Join(workspace.logsDir, "client.log"), scenario.ExpectClientLogContains)
+	if len(scenario.ExpectedClientDNSEnvironment) > 0 {
+		dnsEnvironmentPath := filepath.Join(workspace.logsDir, "client-dns.env")
+		dnsEnvironmentContent, readErr := os.ReadFile(dnsEnvironmentPath)
+		if readErr != nil {
+			t.Fatalf("read real OpenVPN client DNS environment: %v", readErr)
+		}
+		actualDNSEnvironment := strings.Split(strings.TrimSpace(string(dnsEnvironmentContent)), "\n")
+		if !slices.Equal(actualDNSEnvironment, scenario.ExpectedClientDNSEnvironment) {
+			t.Fatalf("expected real OpenVPN client DNS environment %q, got %q", scenario.ExpectedClientDNSEnvironment, actualDNSEnvironment)
+		}
+	}
 }
 
 func tlsFixturePath(scenario interopScenario, server bool, name string) string {
@@ -1029,6 +1055,15 @@ func mergeTunnelConfiguration(base openvpn.TunnelConfiguration, overlay openvpn.
 	if len(overlay.DNS) > 0 {
 		merged.DNS = slices.Clone(overlay.DNS)
 	}
+	if len(overlay.DNSServers) > 0 {
+		merged.DNSServers = slices.Clone(overlay.DNSServers)
+	}
+	if len(overlay.SearchDomains) > 0 {
+		merged.SearchDomains = slices.Clone(overlay.SearchDomains)
+	}
+	if len(overlay.DNSRoutes) > 0 {
+		merged.DNSRoutes = slices.Clone(overlay.DNSRoutes)
+	}
 	if len(overlay.DHCPOptions) > 0 {
 		merged.DHCPOptions = slices.Clone(overlay.DHCPOptions)
 	}
@@ -1045,7 +1080,14 @@ func cloneTunnelConfiguration(configuration openvpn.TunnelConfiguration) openvpn
 	clonedConfiguration.IPv4Routes = slices.Clone(configuration.IPv4Routes)
 	clonedConfiguration.IPv6Routes = slices.Clone(configuration.IPv6Routes)
 	clonedConfiguration.DNS = slices.Clone(configuration.DNS)
+	clonedConfiguration.DNSServers = slices.Clone(configuration.DNSServers)
+	for i := range clonedConfiguration.DNSServers {
+		clonedConfiguration.DNSServers[i].Addresses = slices.Clone(configuration.DNSServers[i].Addresses)
+		clonedConfiguration.DNSServers[i].ResolveDomains = slices.Clone(configuration.DNSServers[i].ResolveDomains)
+	}
 	clonedConfiguration.DHCPOptions = slices.Clone(configuration.DHCPOptions)
+	clonedConfiguration.SearchDomains = slices.Clone(configuration.SearchDomains)
+	clonedConfiguration.DNSRoutes = slices.Clone(configuration.DNSRoutes)
 	clonedConfiguration.RedirectGatewayFlags = slices.Clone(configuration.RedirectGatewayFlags)
 	clonedConfiguration.ProtocolFlags = slices.Clone(configuration.ProtocolFlags)
 	if configuration.PeerID != nil {

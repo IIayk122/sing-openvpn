@@ -44,6 +44,10 @@ tls-crypt-v2 {{ .TLSCryptV2Path }}
 {{- if .AuthFilePath }}
 auth-user-pass {{ .AuthFilePath }}
 {{- end }}
+{{- if .UpScriptPath }}
+script-security 2
+up {{ .UpScriptPath }}
+{{- end }}
 {{- if .RouteNoPull }}
 route-nopull
 {{- end }}
