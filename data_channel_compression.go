@@ -39,6 +39,19 @@ func isLZOCompressionEnabled(compression string, compressionLZO string) bool {
 	return false
 }
 
+// Upstream options_string emits the ,comp-lzo OCC token for every
+// comp.alg != COMP_ALG_UNDEF, not only for LZO framing.
+func isCompressionFramingEnabled(compression string, compressionLZO string) bool {
+	if isLZOCompressionEnabled(compression, compressionLZO) {
+		return true
+	}
+	switch compression {
+	case "stub", "stub-v2", "lz4", "lz4-v2":
+		return true
+	}
+	return false
+}
+
 func (f *dataChannelFraming) encodeLZOFrame(payload []byte) []byte {
 	if !f.compressionLZOOutbound || len(payload) < openVPNCompressionThreshold || !f.lzoCompressionEnabled(time.Now()) {
 		return append([]byte{openVPNNoCompressByte}, payload...)

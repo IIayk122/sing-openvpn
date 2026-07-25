@@ -174,6 +174,11 @@ func parseControlOrAcknowledgmentPacket(packet *Packet, packetBody []byte) (*Pac
 	if err != nil {
 		return nil, E.Extend(ErrPacketParse, "read acknowledgment count: ", err)
 	}
+	// Upstream reliable_ack_parse aborts once RELIABLE_ACK_SIZE entries have
+	// been read instead of accepting the declared count.
+	if int(acknowledgmentCount) > AcknowledgmentSetCapacity {
+		return nil, E.Extend(ErrPacketParse, "too many acknowledgment ids: ", acknowledgmentCount)
+	}
 	packet.AcknowledgmentIDs = make([]PacketID, int(acknowledgmentCount))
 	for acknowledgmentIndex := 0; acknowledgmentIndex < len(packet.AcknowledgmentIDs); acknowledgmentIndex++ {
 		var acknowledgmentValue uint32

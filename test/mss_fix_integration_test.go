@@ -157,7 +157,9 @@ func runMSSFixDataPathSession(t *testing.T, protocol string, cipher string, mssF
 	firstFragmentPacket[11] = 0
 	binary.BigEndian.PutUint16(firstFragmentPacket[10:12], internetChecksum(firstFragmentPacket[:20]))
 	receivedPacket = exchangeMSSFixPacket(t, server, client, firstFragmentPacket, serverToClient)
-	assertTCPSYNMSS(t, receivedPacket, 65000)
+	// Upstream mss_fixup_ipv4 masks frag_off with OPENVPN_IP_OFFMASK (0x1fff),
+	// so the first fragment still carries the TCP header and is clamped.
+	assertTCPSYNMSS(t, receivedPacket, expectedMSS)
 	incompletePacket := append(append([]byte{}, packet...), 0)
 	receivedPacket = exchangeMSSFixPacket(t, server, client, incompletePacket, serverToClient)
 	assertTCPSYNMSS(t, receivedPacket, 65000)

@@ -1,7 +1,9 @@
 package openvpn
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"net"
 	"sync"
 	"time"
@@ -49,6 +51,7 @@ type tlsPeerSession struct {
 	sessionManager          *proto.SessionManager
 	controlChannel          *tlsControlChannel
 	tlsConnection           *tls.Conn
+	controlReader           *tlsControlMessageReader
 	dataCodec               dataCodec
 	protection              tlsControlProtection
 	dataTransportHeaderSize int
@@ -94,21 +97,73 @@ type tlsPeerSession struct {
 }
 
 // Upstream BUF_SIZE (ssl.c) bounds plaintext control payloads.
-func readTLSControlRecord(connection *tls.Conn, timeout time.Duration) ([]byte, error) {
+const tlsControlMessageMaxLength = 16384
+
+// crypto/tls splits a single Write above maxPayloadSizeForWrite into several
+// records and never merges records on Read, so a record boundary carries no
+// message framing.  Upstream key_method_2_read consumes a fixed layout and
+// send_control_channel_string NUL-terminates its payload; both are reassembled
+// here across reads, and bytes belonging to the next message stay buffered.
+type tlsControlMessageReader struct {
+	connection   *tls.Conn
+	peerIsServer bool
+	pending      []byte
+}
+
+func (r *tlsControlMessageReader) read(timeout time.Duration) ([]byte, error) {
+	readDeadline := time.Time{}
 	if timeout > 0 {
-		err := connection.SetReadDeadline(time.Now().Add(timeout))
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		_ = connection.SetReadDeadline(time.Time{})
+		readDeadline = time.Now().Add(timeout)
 	}
-	buffer := make([]byte, 16384)
-	readCount, err := connection.Read(buffer)
+	err := r.connection.SetReadDeadline(readDeadline)
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte{}, buffer[:readCount]...), nil
+	readBuffer := make([]byte, tlsControlMessageMaxLength)
+	for {
+		messageLength, complete := tlsControlMessageLength(r.pending, r.peerIsServer)
+		if complete {
+			message := r.pending[:messageLength]
+			r.pending = append([]byte(nil), r.pending[messageLength:]...)
+			return message, nil
+		}
+		if len(r.pending) >= tlsControlMessageMaxLength {
+			return nil, E.New("oversized tls control message")
+		}
+		readCount, readErr := r.connection.Read(readBuffer)
+		r.pending = append(r.pending, readBuffer[:readCount]...)
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+}
+
+func tlsControlMessageLength(message []byte, peerIsServer bool) (int, bool) {
+	if len(message) < 5 {
+		return 0, false
+	}
+	if binary.BigEndian.Uint32(message[:4]) != 0 || message[4]&0x0f != tlsKeyMethod2 {
+		nullIndex := bytes.IndexByte(message, 0)
+		if nullIndex < 0 {
+			return 0, false
+		}
+		return nullIndex + 1, true
+	}
+	// Upstream key_source2_read reads pre_master only from the client.
+	messageLength := tlsKeyMethod2HeaderLength + 2*tlsKeyMethodRandomLength
+	if !peerIsServer {
+		messageLength += tlsKeyMethodPreMasterLength
+	}
+	for range tlsKeyMethod2StringCount {
+		if len(message) < messageLength+2 {
+			return 0, false
+		}
+		messageLength += 2 + int(binary.BigEndian.Uint16(message[messageLength:messageLength+2]))
+	}
+	if len(message) < messageLength {
+		return 0, false
+	}
+	return messageLength, true
 }
 
 func (s *tlsPeerSession) handleIncomingHardReset(packet *proto.Packet) {
@@ -117,6 +172,13 @@ func (s *tlsPeerSession) handleIncomingHardReset(packet *proto.Packet) {
 	}
 	remoteSessionID, hasRemoteSessionID := s.sessionManager.RemoteSessionID()
 	if hasRemoteSessionID && packet.LocalSessionID == remoteSessionID {
+		return
+	}
+	// Upstream tls_pre_decrypt routes a hard reset whose session id matches no
+	// live session to a fresh TM_INITIAL session and leaves TM_ACTIVE running.
+	// Without tls-auth/tls-crypt nothing authenticated the packet, so acting on
+	// it would let any forged datagram tear the tunnel down.
+	if s.protection.crypt == nil && s.protection.auth == nil {
 		return
 	}
 	// Upstream hard resets create a new tls_session and key_state.
@@ -181,6 +243,10 @@ func (s *tlsPeerSession) installInitialControlChannel(channel *tlsControlChannel
 	}
 	s.controlChannel = channel
 	s.tlsConnection = tlsConnection
+	s.controlReader = &tlsControlMessageReader{
+		connection:   tlsConnection,
+		peerIsServer: s.role == tlsRoleClient,
+	}
 	channel.loopWaitGroup.Add(2)
 	go channel.runReader()
 	go channel.runSender()

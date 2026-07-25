@@ -13,11 +13,12 @@ import (
 )
 
 type staticKeyClientSession struct {
-	parent           *Client
-	remote           clientRemote
-	sessionManager   *proto.SessionManager
-	dataCodec        dataCodec
-	packetConnection proto.PacketConnection
+	parent             *Client
+	remote             clientRemote
+	sessionManager     *proto.SessionManager
+	dataCodec          dataCodec
+	packetConnection   proto.PacketConnection
+	localOptionsString string
 
 	sessionContext context.Context
 	cancelSession  context.CancelFunc
@@ -63,6 +64,17 @@ func newStaticKeyClientSession(parent *Client, remote clientRemote) (*staticKeyC
 		sessionManager: sessionManager,
 		dataCodec:      codec,
 		done:           make(chan error, 1),
+		localOptionsString: buildOptionsString(optionsStringParameters{
+			protocol:       remote.remote.Protocol,
+			isClient:       true,
+			staticKey:      true,
+			compression:    parent.options.DataChannel.Compression,
+			compressionLZO: parent.options.DataChannel.CompressionLZO,
+			fragment:       parent.options.DataChannel.Fragment,
+			cipherName:     parent.options.DataChannel.Cipher,
+			authName:       parent.options.DataChannel.Auth,
+			tunMTU:         parent.options.DataChannel.MTU,
+		}),
 	}, nil
 }
 
@@ -250,6 +262,7 @@ func (s *staticKeyClientSession) readLoop() {
 		}
 		rawPacketBuffers, readErr := s.packetConnection.ReadPackets()
 		decodedPayloads := make([][]byte, 0, len(rawPacketBuffers))
+		var occResponses [][]byte
 		authenticatedPacketReceived := false
 		for _, rawPacketBuffer := range rawPacketBuffers {
 			_, decodedPayload, decodeError := s.dataCodec.Decode(nil, rawPacketBuffer.Bytes())
@@ -269,9 +282,28 @@ func (s *staticKeyClientSession) readLoop() {
 			if bytes.Equal(framedPayload, openVPNDataChannelPingPayload) {
 				continue
 			}
+			// Upstream arms occ_interval only when !TLS_MODE, so the OCC
+			// exchange runs exactly on this --secret data channel.
+			if occOpcode(framedPayload) == int(openVPNOCCExit) {
+				s.parent.handleIncomingDataPayloads(decodedPayloads, s.dataCodec, dataTransportHeaderSize(s.remote.remote.Protocol), openVPNOuterTransportOverhead(s.remote.remote.Protocol, s.packetConnection.RemoteAddr()))
+				buf.ReleaseMulti(rawPacketBuffers)
+				s.finish(ErrPeerExit)
+				return
+			}
+			response, shouldRespond := buildOCCResponseForIncoming(framedPayload, s.localOptionsString)
+			if shouldRespond {
+				occResponses = append(occResponses, response)
+				continue
+			}
+			if bytes.HasPrefix(framedPayload, openVPNOCCMagic) {
+				continue
+			}
 			decodedPayloads = append(decodedPayloads, framedPayload)
 		}
 		buf.ReleaseMulti(rawPacketBuffers)
+		for _, occResponse := range occResponses {
+			_ = s.WriteDataPackets([][]byte{occResponse})
+		}
 		if authenticatedPacketReceived {
 			s.access.Lock()
 			s.lastInboundTime = time.Now()

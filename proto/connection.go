@@ -63,30 +63,25 @@ type streamPacketConnection struct {
 	writer      N.VectorisedWriter
 	readAccess  sync.Mutex
 	writeAccess sync.Mutex
+
+	// Every caller drives reads with a short deadline and retries on timeout,
+	// so a frame interrupted between its length prefix and its body must be
+	// resumed instead of restarted; otherwise the stream desynchronizes.
+	pendingLengthBuffer [2]byte
+	pendingLengthCount  int
+	pendingPacketBuffer *buf.Buffer
+	pendingPacketOffset int
 }
 
 func (c *streamPacketConnection) ReadPacket() ([]byte, error) {
 	c.readAccess.Lock()
 	defer c.readAccess.Unlock()
-	return c.readPacket()
-}
-
-func (c *streamPacketConnection) readPacket() ([]byte, error) {
-	reader := io.Reader(c.connection)
-	if c.reader != nil {
-		reader = c.reader
-	}
-	var lengthBuffer [2]byte
-	_, err := io.ReadFull(reader, lengthBuffer[:])
+	packetBuffer, err := c.readPacketBuffer()
 	if err != nil {
 		return nil, err
 	}
-	packetLength := binary.BigEndian.Uint16(lengthBuffer[:])
-	packet := make([]byte, packetLength)
-	_, err = io.ReadFull(reader, packet)
-	if err != nil {
-		return nil, err
-	}
+	packet := append([]byte{}, packetBuffer.Bytes()...)
+	packetBuffer.Release()
 	return packet, nil
 }
 
@@ -125,18 +120,37 @@ func (c *streamPacketConnection) readPacketBuffer() (*buf.Buffer, error) {
 	if c.reader != nil {
 		reader = c.reader
 	}
-	var lengthBuffer [2]byte
-	_, err := io.ReadFull(reader, lengthBuffer[:])
-	if err != nil {
-		return nil, err
+	if c.pendingPacketBuffer == nil {
+		for c.pendingLengthCount < len(c.pendingLengthBuffer) {
+			readCount, err := reader.Read(c.pendingLengthBuffer[c.pendingLengthCount:])
+			c.pendingLengthCount += readCount
+			if err != nil {
+				return nil, err
+			}
+		}
+		packetLength := int(binary.BigEndian.Uint16(c.pendingLengthBuffer[:]))
+		c.pendingLengthCount = 0
+		packetBuffer := buf.NewSize(packetLength)
+		packetBuffer.Extend(packetLength)
+		c.pendingPacketBuffer = packetBuffer
+		c.pendingPacketOffset = 0
 	}
-	packetLength := int(binary.BigEndian.Uint16(lengthBuffer[:]))
-	packetBuffer := buf.NewSize(packetLength)
-	_, err = io.ReadFull(reader, packetBuffer.Extend(packetLength))
-	if err != nil {
-		packetBuffer.Release()
-		return nil, err
+	packetBody := c.pendingPacketBuffer.Bytes()
+	for c.pendingPacketOffset < len(packetBody) {
+		readCount, err := reader.Read(packetBody[c.pendingPacketOffset:])
+		c.pendingPacketOffset += readCount
+		if err != nil {
+			if !E.IsTimeout(err) {
+				c.pendingPacketBuffer.Release()
+				c.pendingPacketBuffer = nil
+				c.pendingPacketOffset = 0
+			}
+			return nil, err
+		}
 	}
+	packetBuffer := c.pendingPacketBuffer
+	c.pendingPacketBuffer = nil
+	c.pendingPacketOffset = 0
 	return packetBuffer, nil
 }
 

@@ -159,7 +159,8 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 	if certificateIdentityErr != nil {
 		return nil, certificateIdentityErr
 	}
-	clientKeyMethodRecord, err := readTLSControlRecord(tlsConnection, time.Until(deadline))
+	controlReader := &tlsControlMessageReader{connection: tlsConnection, peerIsServer: false}
+	clientKeyMethodRecord, err := controlReader.read(time.Until(deadline))
 	if err != nil {
 		return nil, err
 	}

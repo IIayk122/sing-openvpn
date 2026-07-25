@@ -500,16 +500,17 @@ func (c *tlsClient) exchangeKeyMethod() error {
 	if selectedAuth == "" {
 		selectedAuth = "SHA1"
 	}
-	localOptionsString := buildTLSOptionsStringWithMTU(
-		c.remote.remote.Protocol,
-		true,
-		c.parent.options.TLS.Auth.IsSet(),
-		c.parent.options.DataChannel.Compression,
-		c.parent.options.DataChannel.CompressionLZO,
-		tlsPreferredCipher(c.parent.options),
-		selectedAuth,
-		c.parent.options.DataChannel.MTU,
-	)
+	localOptionsString := buildOptionsString(optionsStringParameters{
+		protocol:       c.remote.remote.Protocol,
+		isClient:       true,
+		tlsAuthEnabled: c.parent.options.TLS.Auth.IsSet(),
+		compression:    c.parent.options.DataChannel.Compression,
+		compressionLZO: c.parent.options.DataChannel.CompressionLZO,
+		fragment:       c.parent.options.DataChannel.Fragment,
+		cipherName:     tlsPreferredCipher(c.parent.options),
+		authName:       selectedAuth,
+		tunMTU:         c.parent.options.DataChannel.MTU,
+	})
 	keyMethodPayload, err := buildTLSKeyMethod2Payload(false, tlsKeyMethodMessage{
 		OptionsString: localOptionsString,
 		Username:      username,
@@ -526,7 +527,7 @@ func (c *tlsClient) exchangeKeyMethod() error {
 	if err != nil {
 		return err
 	}
-	controlRecord, err := readTLSControlRecord(c.tlsConnection, 5*time.Second)
+	controlRecord, err := c.controlReader.read(5 * time.Second)
 	if err != nil {
 		return err
 	}
@@ -589,6 +590,7 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 		return nil, handshakeErr
 	}
 	channel.setTLSConnection(tlsConnection)
+	controlReader := &tlsControlMessageReader{connection: tlsConnection, peerIsServer: true}
 	clientKeySource, err := generateTLSKeyMethodKeySource(true)
 	if err != nil {
 		return nil, err
@@ -608,7 +610,7 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 	if writeErr != nil {
 		return nil, writeErr
 	}
-	controlRecord, err := readTLSControlRecord(tlsConnection, time.Until(deadline))
+	controlRecord, err := controlReader.read(time.Until(deadline))
 	if err != nil {
 		return nil, err
 	}
@@ -650,20 +652,20 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 		return nil, err
 	}
 	_ = tlsConnection.SetDeadline(time.Time{})
-	go c.renegotiationControlMessageLoop(tlsConnection)
+	go c.renegotiationControlMessageLoop(controlReader)
 	return newCodec, nil
 }
 
 // Upstream creates a separate TLS control stream for every soft-reset and may
 // send token-only PUSH_REPLY records on the newly active key state.
-func (c *tlsClient) renegotiationControlMessageLoop(tlsConnection *tls.Conn) {
+func (c *tlsClient) renegotiationControlMessageLoop(controlReader *tlsControlMessageReader) {
 	for {
 		select {
 		case <-c.sessionContext.Done():
 			return
 		default:
 		}
-		controlRecord, err := readTLSControlRecord(tlsConnection, time.Second)
+		controlRecord, err := controlReader.read(time.Second)
 		if err != nil {
 			if E.IsTimeout(err) {
 				continue

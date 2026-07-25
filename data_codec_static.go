@@ -197,7 +197,7 @@ func newStaticKeyDataCodec(staticKey Material, keyDirection int, cipherName stri
 		return nil, err
 	}
 	keySlots := splitStaticKeyMaterial(staticKeyMaterial)
-	sendSlotIndex, receiveSlotIndex, receiveFallbackIndex := resolveStaticKeyDirection(keyDirection)
+	sendSlotIndex, receiveSlotIndex := resolveStaticKeyDirection(keyDirection)
 	sendSlot := keySlots[sendSlotIndex]
 	receiveSlot := keySlots[receiveSlotIndex]
 	sendCipherBlock, err := newStaticCipherBlock(cipherName, sendSlot.cipherKey, cipherKeySize)
@@ -222,22 +222,6 @@ func newStaticKeyDataCodec(staticKey Material, keyDirection int, cipherName stri
 			hmacKey:     receiveHMACKey,
 		},
 	}
-	if receiveFallbackIndex >= 0 && receiveFallbackIndex != receiveSlotIndex {
-		fallbackSlot := keySlots[receiveFallbackIndex]
-		fallbackCipherBlock, fallbackCipherErr := newStaticCipherBlock(cipherName, fallbackSlot.cipherKey, cipherKeySize)
-		if fallbackCipherErr != nil {
-			return nil, fallbackCipherErr
-		}
-		var fallbackHMACKey []byte
-		if hmacSize > 0 {
-			fallbackHMACKey = make([]byte, hmacSize)
-			copy(fallbackHMACKey, fallbackSlot.hmacKey[:hmacSize])
-		}
-		receiveCandidates = append(receiveCandidates, staticKeyDecodeCandidate{
-			cipherBlock: fallbackCipherBlock,
-			hmacKey:     fallbackHMACKey,
-		})
-	}
 	return &staticKeyDataCodec{
 		sendCipherBlock:   sendCipherBlock,
 		sendHMACKey:       sendHMACKey,
@@ -249,14 +233,16 @@ func newStaticKeyDataCodec(staticKey Material, keyDirection int, cipherName stri
 	}, nil
 }
 
-func resolveStaticKeyDirection(keyDirection int) (int, int, int) {
+// Upstream key_direction_state_init installs exactly one decrypt key, so the
+// local send slot never authenticates inbound traffic.
+func resolveStaticKeyDirection(keyDirection int) (int, int) {
 	if keyDirection == 1 || keyDirection == 2 {
-		return 1, 0, 1
+		return 1, 0
 	}
 	if keyDirection < 0 {
-		return 0, 0, 1
+		return 0, 0
 	}
-	return 0, 1, 0
+	return 0, 1
 }
 
 func splitStaticKeyMaterial(staticKeyMaterial []byte) []staticKeySlot {

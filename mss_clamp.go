@@ -9,6 +9,10 @@ const (
 	ipv6HeaderLength    = 40
 	ipProtocolTCP       = 6
 
+	// Upstream OPENVPN_IP_OFFMASK (proto.h) covers only the 13-bit fragment
+	// offset, so the DF and MF flags do not suppress the clamp.
+	ipv4FragmentOffsetMask = 0x1fff
+
 	tcpHeaderMinLength = 20
 	tcpFlagSYN         = 0x02
 	tcpOptionKindEnd   = 0
@@ -64,7 +68,7 @@ func locateTCPSYNMSSOption(packet []byte) (tcpHeaderOffset int, mssValueOffset i
 		if len(packet) < ipv4HeaderMinLength {
 			return 0, 0, 0, false
 		}
-		if int(binary.BigEndian.Uint16(packet[2:4])) != len(packet) || binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
+		if int(binary.BigEndian.Uint16(packet[2:4])) != len(packet) || binary.BigEndian.Uint16(packet[6:8])&ipv4FragmentOffsetMask != 0 {
 			return 0, 0, 0, false
 		}
 		ihl := int(packet[0]&0x0f) * 4

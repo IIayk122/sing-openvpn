@@ -41,7 +41,7 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 		if readTimeout <= 0 {
 			readTimeout = time.Millisecond
 		}
-		controlRecord, readErr := readTLSControlRecord(c.tlsConnection, readTimeout)
+		controlRecord, readErr := c.controlReader.read(readTimeout)
 		if readErr != nil {
 			cancelErr := c.canceledChallengeError()
 			if cancelErr != nil {
@@ -142,7 +142,7 @@ func (c *tlsClient) controlMessageLoop() {
 			return
 		default:
 		}
-		controlRecord, err := readTLSControlRecord(c.tlsConnection, time.Second)
+		controlRecord, err := c.controlReader.read(time.Second)
 		if err != nil {
 			if E.IsTimeout(err) {
 				continue

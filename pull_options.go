@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"math"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -16,6 +17,18 @@ const (
 	pushReplyPayloadPrefix   = "PUSH_REPLY"
 	pushUpdatePayloadPrefix  = "PUSH_UPDATE"
 )
+
+// Above this a second count no longer survives conversion to time.Duration and
+// wraps into a small positive interval.
+const maximumPushedDurationSeconds = int(math.MaxInt64 / int64(time.Second))
+
+func parsePushedDurationSeconds(optionValue string) (time.Duration, bool) {
+	seconds, err := strconv.Atoi(strings.TrimSpace(optionValue))
+	if err != nil || seconds < 0 || seconds > maximumPushedDurationSeconds {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
+}
 
 type pushedOptionParseError struct {
 	Name  string
@@ -218,15 +231,15 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 				wireOptions.RouteMetricSet = true
 			}
 		case "ping":
-			pingValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && pingValue >= 0 {
-				wireOptions.PingInterval = time.Duration(pingValue) * time.Second
+			pingInterval, parsed := parsePushedDurationSeconds(optionValue)
+			if parsed {
+				wireOptions.PingInterval = pingInterval
 				wireOptions.PingIntervalEnabled = true
 			}
 		case "ping-restart":
-			pingRestartValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && pingRestartValue >= 0 {
-				wireOptions.PingRestart = time.Duration(pingRestartValue) * time.Second
+			pingRestart, parsed := parsePushedDurationSeconds(optionValue)
+			if parsed {
+				wireOptions.PingRestart = pingRestart
 				wireOptions.PingRestartEnabled = true
 				wireOptions.PingTimeoutAction = pushedPingTimeoutRestart
 			}
@@ -284,9 +297,9 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 		case "inactive":
 			inactiveFields := strings.Fields(optionValue)
 			if len(inactiveFields) >= 1 {
-				inactiveSeconds, err := strconv.Atoi(inactiveFields[0])
-				if err == nil && inactiveSeconds >= 0 {
-					wireOptions.InactiveTimeout = time.Duration(inactiveSeconds) * time.Second
+				inactiveTimeout, parsed := parsePushedDurationSeconds(inactiveFields[0])
+				if parsed {
+					wireOptions.InactiveTimeout = inactiveTimeout
 					wireOptions.InactiveTimeoutSet = true
 				}
 				if len(inactiveFields) >= 2 {
@@ -299,15 +312,15 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 				}
 			}
 		case "session-timeout":
-			sessionSeconds, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && sessionSeconds >= 0 {
-				wireOptions.SessionTimeout = time.Duration(sessionSeconds) * time.Second
+			sessionTimeout, parsed := parsePushedDurationSeconds(optionValue)
+			if parsed {
+				wireOptions.SessionTimeout = sessionTimeout
 				wireOptions.SessionTimeoutSet = true
 			}
 		case "ping-exit":
-			pingExitSeconds, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && pingExitSeconds >= 0 {
-				wireOptions.PingExit = time.Duration(pingExitSeconds) * time.Second
+			pingExit, parsed := parsePushedDurationSeconds(optionValue)
+			if parsed {
+				wireOptions.PingExit = pingExit
 				wireOptions.PingExitSet = true
 				wireOptions.PingTimeoutAction = pushedPingTimeoutExit
 			}

@@ -107,13 +107,10 @@ func newControlAuthCodecWithAuth(staticKey Material, keyDirection int, authName 
 		return nil, E.New("tls-auth requires a non-NONE auth algorithm")
 	}
 	keySlots := splitStaticKeyMaterial(staticKeyMaterial)
-	sendSlotIndex, receiveSlotIndex, receiveFallbackIndex := resolveStaticKeyDirection(keyDirection)
+	sendSlotIndex, receiveSlotIndex := resolveStaticKeyDirection(keyDirection)
 	sendKey := append([]byte{}, keySlots[sendSlotIndex].hmacKey[:digestSize]...)
 	receiveKeys := [][]byte{
 		append([]byte{}, keySlots[receiveSlotIndex].hmacKey[:digestSize]...),
-	}
-	if receiveFallbackIndex >= 0 && receiveFallbackIndex != receiveSlotIndex {
-		receiveKeys = append(receiveKeys, append([]byte{}, keySlots[receiveFallbackIndex].hmacKey[:digestSize]...))
 	}
 	return &controlAuthCodec{
 		sendKey:      sendKey,
@@ -220,30 +217,21 @@ func newControlCryptCodec(staticKey Material, keyDirection int) (*controlCryptCo
 
 func newControlCryptCodecFromMaterial(staticKeyMaterial []byte, keyDirection int) (*controlCryptCodec, error) {
 	keySlots := splitStaticKeyMaterial(staticKeyMaterial)
-	sendSlotIndex, receiveSlotIndex, receiveFallbackIndex := resolveStaticKeyDirection(keyDirection)
+	sendSlotIndex, receiveSlotIndex := resolveStaticKeyDirection(keyDirection)
 
 	sendEncryptBlock, sendAuthKey, err := newControlCryptKeys(keySlots[sendSlotIndex])
 	if err != nil {
 		return nil, err
 	}
-	receiveCandidates := make([]controlCryptCandidate, 0, 2)
 	receiveEncryptBlock, receiveAuthKey, err := newControlCryptKeys(keySlots[receiveSlotIndex])
 	if err != nil {
 		return nil, err
 	}
-	receiveCandidates = append(receiveCandidates, controlCryptCandidate{
-		encryptBlock: receiveEncryptBlock,
-		authKey:      receiveAuthKey,
-	})
-	if receiveFallbackIndex >= 0 && receiveFallbackIndex != receiveSlotIndex {
-		fallbackEncryptBlock, fallbackAuthKey, fallbackErr := newControlCryptKeys(keySlots[receiveFallbackIndex])
-		if fallbackErr != nil {
-			return nil, fallbackErr
-		}
-		receiveCandidates = append(receiveCandidates, controlCryptCandidate{
-			encryptBlock: fallbackEncryptBlock,
-			authKey:      fallbackAuthKey,
-		})
+	receiveCandidates := []controlCryptCandidate{
+		{
+			encryptBlock: receiveEncryptBlock,
+			authKey:      receiveAuthKey,
+		},
 	}
 	return &controlCryptCodec{
 		sendEncryptBlock:  sendEncryptBlock,

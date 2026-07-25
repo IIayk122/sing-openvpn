@@ -3,6 +3,7 @@ package openvpn
 import (
 	"encoding/binary"
 	"net"
+	"slices"
 	"time"
 
 	"github.com/sagernet/sing-openvpn/proto"
@@ -113,6 +114,18 @@ func (s *tlsServer) preDecryptUDPPacket(rawPacket []byte, peerAddress net.Addr, 
 		}
 		if !s.sessionIDHMACSigner.validateAt(packet.LocalSessionID, peerAddress, packet.RemoteSessionID, now.Unix()) {
 			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("invalid UDP session-id cookie")
+		}
+		// Upstream check_session_hmac_and_pkt_id rejects packet ids and
+		// acknowledged ids above 1, which cannot belong to the three-way
+		// handshake the cookie authorizes.
+		outOfRange := slices.ContainsFunc(packet.AcknowledgmentIDs, func(acknowledgmentID proto.PacketID) bool {
+			return acknowledgmentID > 1
+		})
+		if outOfRange {
+			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("out of range UDP cookie acknowledgment id")
+		}
+		if packet.Opcode != proto.OpcodeAcknowledgmentV1 && packet.ID > 1 {
+			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("out of range UDP cookie packet id")
 		}
 		if len(s.tlsCryptV2Server) > 0 {
 			if packet.Opcode != proto.OpcodeControlWKCv1 {

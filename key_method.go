@@ -19,6 +19,13 @@ import (
 const (
 	tlsKeyMethod2 = 2
 
+	// Upstream key_method_2_write emits a zero uint32, the key-method byte,
+	// the key source material and then options, username, password, peer-info.
+	tlsKeyMethod2HeaderLength   = 5
+	tlsKeyMethodPreMasterLength = 48
+	tlsKeyMethodRandomLength    = 32
+	tlsKeyMethod2StringCount    = 4
+
 	tlsIVProtoDataV2        = 1 << 1
 	tlsIVProtoRequestPush   = 1 << 2
 	tlsIVProtoTLSKeyExport  = 1 << 3
@@ -67,7 +74,22 @@ func generateTLSKeyMethodKeySource(isClient bool) (tlsKeyMethodKeySource, error)
 	return keySource, nil
 }
 
-func buildTLSOptionsStringWithMTU(protocol string, isClient bool, tlsAuthEnabled bool, compression string, compressionLZO string, cipherName string, authName string, tunMTU uint32) string {
+type optionsStringParameters struct {
+	protocol       string
+	isClient       bool
+	staticKey      bool
+	tlsAuthEnabled bool
+	compression    string
+	compressionLZO string
+	fragment       uint32
+	cipherName     string
+	authName       string
+	tunMTU         uint32
+}
+
+// Upstream options_string (options.c) builds the OCC options string.
+func buildOptionsString(parameters optionsStringParameters) string {
+	tunMTU := parameters.tunMTU
 	if tunMTU == 0 {
 		tunMTU = 1500
 	}
@@ -78,20 +100,23 @@ func buildTLSOptionsStringWithMTU(protocol string, isClient bool, tlsAuthEnabled
 	builder.WriteString(",tun-mtu ")
 	builder.WriteString(strconv.FormatUint(uint64(tunMTU), 10))
 	builder.WriteString(",proto ")
-	builder.WriteString(tlsProtoName(protocol, isClient))
+	builder.WriteString(tlsProtoName(parameters.protocol, parameters.isClient))
 
-	if isLZOCompressionEnabled(compression, compressionLZO) {
+	if isCompressionFramingEnabled(parameters.compression, parameters.compressionLZO) {
 		builder.WriteString(",comp-lzo")
 	}
+	if parameters.fragment > 0 {
+		builder.WriteString(",mtu-dynamic")
+	}
 
-	resolvedCipher := cipherName
+	resolvedCipher := parameters.cipherName
 	if resolvedCipher == "" {
 		resolvedCipher = "AES-256-GCM"
 	}
 	builder.WriteString(",cipher ")
 	builder.WriteString(resolvedCipher)
 
-	resolvedAuth := authName
+	resolvedAuth := parameters.authName
 	if resolvedAuth == "" {
 		resolvedAuth = "SHA1"
 	}
@@ -104,11 +129,15 @@ func buildTLSOptionsStringWithMTU(protocol string, isClient bool, tlsAuthEnabled
 		builder.WriteString(keySize)
 	}
 
-	if tlsAuthEnabled {
+	if parameters.staticKey {
+		builder.WriteString(",secret")
+		return builder.String()
+	}
+	if parameters.tlsAuthEnabled {
 		builder.WriteString(",tls-auth")
 	}
 	builder.WriteString(",key-method 2,")
-	if isClient {
+	if parameters.isClient {
 		builder.WriteString("tls-client")
 	} else {
 		builder.WriteString("tls-server")

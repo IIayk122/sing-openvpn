@@ -51,12 +51,13 @@ func (p *tlsServerPinger) runLoop(ctx context.Context) {
 			return
 		}
 		if p.pingInterval > 0 && now.Sub(lastOutbound) >= p.pingInterval {
+			// Upstream check_ping_send_dowork never terminates the instance
+			// because a keepalive could not be queued; tryWriteDataPacket also
+			// reports plain contention on the data write lock.
 			writeErr := p.session.tryWriteDataPacket(openVPNDataChannelPingPayload)
-			if writeErr != nil {
-				_ = p.session.Close()
-				return
+			if writeErr == nil {
+				p.markActivity(false, true)
 			}
-			p.markActivity(false, true)
 		}
 	}
 }

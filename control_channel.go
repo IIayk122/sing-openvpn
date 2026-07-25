@@ -164,7 +164,8 @@ func (c *tlsControlChannel) seedIncomingPacket(packet *proto.Packet) {
 	if !c.sessionManager.ValidateIncomingRemoteSessionID(packet) {
 		return
 	}
-	c.outgoing.OnIncomingPacket(packet)
+	c.outgoing.OnIncomingAcknowledgments(packet)
+	c.outgoing.AcknowledgeIncomingPacket(packet.ID)
 }
 
 func (c *tlsControlChannel) Read(buffer []byte) (int, error) {
@@ -231,10 +232,12 @@ func (c *tlsControlChannel) Write(buffer []byte) (int, error) {
 			return totalWritten, err
 		}
 		for {
-			packet.AcknowledgmentIDs = c.outgoing.NextAcknowledgmentIDs()
+			acknowledgmentIDs := c.outgoing.NextAcknowledgmentIDs()
+			packet.AcknowledgmentIDs = acknowledgmentIDs
 			if c.outgoing.TryInsertOutgoingPacket(packet) {
 				break
 			}
+			c.outgoing.RestorePendingAcknowledgmentIDs(acknowledgmentIDs)
 			select {
 			case <-c.closed:
 				return totalWritten, net.ErrClosed
@@ -301,28 +304,30 @@ func (c *tlsControlChannel) RemoteAddr() net.Addr {
 	return c.packetConnection.RemoteAddr()
 }
 
+// The root channel, every renegotiation child and the data path all write to
+// the same packetConnection, so a per-channel deadline must never reach the
+// socket: runReader owns the socket read deadline and Read/Write below enforce
+// the channel deadlines locally.
 func (c *tlsControlChannel) SetDeadline(deadline time.Time) error {
 	c.deadlineAccess.Lock()
 	defer c.deadlineAccess.Unlock()
 	c.readDeadline = deadline
 	c.writeDeadline = deadline
-	readErr := c.packetConnection.SetReadDeadline(deadline)
-	writeErr := c.packetConnection.SetWriteDeadline(deadline)
-	return E.Errors(readErr, writeErr)
+	return nil
 }
 
 func (c *tlsControlChannel) SetReadDeadline(deadline time.Time) error {
 	c.deadlineAccess.Lock()
 	defer c.deadlineAccess.Unlock()
 	c.readDeadline = deadline
-	return c.packetConnection.SetReadDeadline(deadline)
+	return nil
 }
 
 func (c *tlsControlChannel) SetWriteDeadline(deadline time.Time) error {
 	c.deadlineAccess.Lock()
 	defer c.deadlineAccess.Unlock()
 	c.writeDeadline = deadline
-	return c.packetConnection.SetWriteDeadline(deadline)
+	return nil
 }
 
 func (c *tlsControlChannel) currentReadDeadline() (time.Time, bool) {
@@ -399,14 +404,13 @@ func (c *tlsControlChannel) runReader() {
 	}
 }
 
+// The socket deadline only bounds how long the reader blocks before it
+// re-checks for shutdown; the per-channel deadlines are enforced by Read and
+// Write, which must not stretch this poll interval.
+const controlChannelReadPollInterval = time.Second
+
 func (c *tlsControlChannel) setNextPacketReadDeadline() error {
-	c.deadlineAccess.Lock()
-	defer c.deadlineAccess.Unlock()
-	readDeadline := c.readDeadline
-	if readDeadline.IsZero() {
-		readDeadline = time.Now().Add(time.Second)
-	}
-	return c.packetConnection.SetReadDeadline(readDeadline)
+	return c.packetConnection.SetReadDeadline(time.Now().Add(controlChannelReadPollInterval))
 }
 
 func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) bool {
@@ -417,7 +421,8 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 		if packet.KeyID != 0 || c.sessionManager.CurrentKeyID() != 0 {
 			return true
 		}
-		c.outgoing.OnIncomingPacket(packet)
+		c.outgoing.OnIncomingAcknowledgments(packet)
+		c.outgoing.AcknowledgeIncomingPacket(packet.ID)
 		c.markReadActivity()
 		if c.onHardReset != nil {
 			c.onHardReset(packet)
@@ -432,7 +437,8 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 			c.markReadActivity()
 			c.onSoftReset(packet)
 		} else {
-			c.outgoing.OnIncomingPacket(packet)
+			c.outgoing.OnIncomingAcknowledgments(packet)
+			c.outgoing.AcknowledgeIncomingPacket(packet.ID)
 			c.markReadActivity()
 		}
 		return true
@@ -443,7 +449,7 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 	if packet.KeyID != c.sessionManager.CurrentKeyID() {
 		return true
 	}
-	c.outgoing.OnIncomingPacket(packet)
+	c.outgoing.OnIncomingAcknowledgments(packet)
 	c.markReadActivity()
 	if packet.Opcode == proto.OpcodeAcknowledgmentV1 {
 		return true
@@ -451,7 +457,12 @@ func (c *tlsControlChannel) processIncomingControlPacket(packet *proto.Packet) b
 	if !packet.Opcode.IsControl() {
 		return true
 	}
-	if !c.incoming.TryInsertIncomingPacket(packet) {
+	admission := c.incoming.TryInsertIncomingPacket(packet)
+	if admission == proto.IncomingPacketOutOfWindow {
+		return true
+	}
+	c.outgoing.AcknowledgeIncomingPacket(packet.ID)
+	if admission == proto.IncomingPacketDuplicate {
 		return true
 	}
 	for _, orderedPacket := range c.incoming.NextOrderedSequence() {
@@ -496,9 +507,11 @@ func (c *tlsControlChannel) runSender() {
 		}
 		ackPacket, err := c.newAcknowledgmentPacket(acknowledgmentIDs)
 		if err != nil {
+			c.outgoing.RestorePendingAcknowledgmentIDs(acknowledgmentIDs)
 			continue
 		}
 		if ackPacket.Opcode == proto.OpcodeControlWKCv1 && !c.outgoing.TryInsertOutgoingPacket(ackPacket) {
+			c.outgoing.RestorePendingAcknowledgmentIDs(acknowledgmentIDs)
 			continue
 		}
 		err = c.writePacket(ackPacket)

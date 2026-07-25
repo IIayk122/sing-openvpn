@@ -214,7 +214,7 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 	if remainingHandshakeWindow <= 0 {
 		return ErrHandshakeTimeout
 	}
-	clientKeyMethodRecord, err := readTLSControlRecord(s.tlsConnection, remainingHandshakeWindow)
+	clientKeyMethodRecord, err := s.controlReader.read(remainingHandshakeWindow)
 	if err != nil {
 		return err
 	}
@@ -258,16 +258,13 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 		return err
 	}
 	s.serverKeySource = serverKeySource
-	localOptionsString := buildTLSOptionsStringWithMTU(
-		s.server.parent.options.Transport.Protocol,
-		false,
-		s.server.parent.options.TLS.Auth.IsSet(),
-		"",
-		"",
-		s.selectedCipher,
-		s.selectedAuth,
-		s.server.parent.options.DataChannel.MTU,
-	)
+	localOptionsString := buildOptionsString(optionsStringParameters{
+		protocol:       s.server.parent.options.Transport.Protocol,
+		tlsAuthEnabled: s.server.parent.options.TLS.Auth.IsSet(),
+		cipherName:     s.selectedCipher,
+		authName:       s.selectedAuth,
+		tunMTU:         s.server.parent.options.DataChannel.MTU,
+	})
 	s.localOptionsString = localOptionsString
 	serverKeyMethodPayload, err := buildTLSKeyMethod2Payload(true, tlsKeyMethodMessage{
 		OptionsString: localOptionsString,
@@ -445,7 +442,7 @@ func validateInitialClientReset(packet *proto.Packet) error {
 
 func (s *tlsServerSession) runControlLoop() error {
 	for {
-		controlRecord, err := readTLSControlRecord(s.tlsConnection, time.Second)
+		controlRecord, err := s.controlReader.read(time.Second)
 		if err != nil {
 			if E.IsTimeout(err) {
 				if s.server.loopContext != nil {

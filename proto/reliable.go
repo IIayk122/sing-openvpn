@@ -25,6 +25,9 @@ type inFlightPacket struct {
 }
 
 func (p *inFlightPacket) scheduleForRetransmission(now time.Time) {
+	// Upstream reliable_send clears n_acks when it hands the entry back for
+	// retransmission, so the fast-retransmit trigger fires once per burst.
+	p.higherPacketAcknowledges = 0
 	p.retransmissionCount++
 	retransmissionInterval := InitialRetransmissionTimeout * time.Duration(1<<max(0, p.retransmissionCount-1))
 	retransmissionInterval = min(retransmissionInterval, MaximumRetransmissionTimeout)
@@ -57,13 +60,10 @@ func (s *OutgoingReliableState) TryInsertOutgoingPacket(packet *Packet) bool {
 	return true
 }
 
-func (s *OutgoingReliableState) OnIncomingPacket(packet *Packet) {
+func (s *OutgoingReliableState) OnIncomingAcknowledgments(packet *Packet) {
 	s.access.Lock()
 	defer s.access.Unlock()
 
-	if packet.Opcode != OpcodeAcknowledgmentV1 && len(s.pendingAcknowledgmentID) < AcknowledgmentSetCapacity {
-		s.pendingAcknowledgmentID[packet.ID] = struct{}{}
-	}
 	for _, acknowledgedID := range packet.AcknowledgmentIDs {
 		for packetIndex := 0; packetIndex < len(s.inFlightPackets); packetIndex++ {
 			trackedPacket := s.inFlightPackets[packetIndex]
@@ -82,6 +82,26 @@ func (s *OutgoingReliableState) OnIncomingPacket(packet *Packet) {
 	sort.SliceStable(s.inFlightPackets, func(leftIndex, rightIndex int) bool {
 		return s.inFlightPackets[leftIndex].packet.ID < s.inFlightPackets[rightIndex].packet.ID
 	})
+}
+
+// Upstream tls_pre_decrypt calls reliable_ack_acknowledge_packet_id only for
+// packets the receive buffer could take, so a dropped packet is never
+// acknowledged and the peer keeps retransmitting it.
+func (s *OutgoingReliableState) AcknowledgeIncomingPacket(packetID PacketID) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if len(s.pendingAcknowledgmentID) >= AcknowledgmentSetCapacity {
+		return
+	}
+	s.pendingAcknowledgmentID[packetID] = struct{}{}
+}
+
+func (s *OutgoingReliableState) RestorePendingAcknowledgmentIDs(acknowledgmentIDs []PacketID) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	for _, acknowledgmentID := range acknowledgmentIDs {
+		s.pendingAcknowledgmentID[acknowledgmentID] = struct{}{}
+	}
 }
 
 func (s *OutgoingReliableState) NextAcknowledgmentIDs() []PacketID {
@@ -146,25 +166,36 @@ func NewIncomingReliableState() *IncomingReliableState {
 	}
 }
 
-func (s *IncomingReliableState) TryInsertIncomingPacket(packet *Packet) bool {
+// Upstream tls_pre_decrypt distinguishes reliable_wont_break_sequentiality and
+// reliable_can_get, which gate the acknowledgment, from reliable_not_replay,
+// which only gates buffering.
+type IncomingPacketAdmission uint8
+
+const (
+	IncomingPacketOutOfWindow IncomingPacketAdmission = iota
+	IncomingPacketDuplicate
+	IncomingPacketBuffered
+)
+
+func (s *IncomingReliableState) TryInsertIncomingPacket(packet *Packet) IncomingPacketAdmission {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if packet.ID <= s.lastConsumedID {
-		return false
+		return IncomingPacketDuplicate
 	}
 	if _, buffered := s.bufferedID[packet.ID]; buffered {
-		return false
+		return IncomingPacketDuplicate
 	}
 	nextExpectedID := s.lastConsumedID + 1
 	if packet.ID-nextExpectedID >= ReliableReceiveBufferSize {
-		return false
+		return IncomingPacketOutOfWindow
 	}
 	if len(s.pendingPackets) >= ReliableReceiveBufferSize {
-		return false
+		return IncomingPacketOutOfWindow
 	}
 	s.pendingPackets = append(s.pendingPackets, packet)
 	s.bufferedID[packet.ID] = struct{}{}
-	return true
+	return IncomingPacketBuffered
 }
 
 func (s *IncomingReliableState) NextOrderedSequence() []*Packet {
