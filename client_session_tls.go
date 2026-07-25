@@ -113,6 +113,7 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 		outgoingDataBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) ([][]*buf.Buffer, error) {
 			return client.parent.outgoingDataBufferBatches(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
 		},
+		decodeIncomingFraming: client.parent.decodeIncomingDataFramingBuffer,
 		deliverIncomingPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) {
 			client.parent.handleIncomingDataPayloads(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
 		},
@@ -306,7 +307,6 @@ func (c *tlsClient) Start() error {
 		false,
 		selectedCipher,
 		selectedAuth,
-		c.remote.remote.Protocol,
 		c.parent.options.DataChannel.ReplayWindow,
 		c.parent.options.DataChannel.ReplayWindowTime,
 	)
@@ -643,7 +643,6 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 		false,
 		c.remoteSelectedCipher,
 		c.remoteSelectedAuth,
-		c.remote.remote.Protocol,
 		c.parent.options.DataChannel.ReplayWindow,
 		c.parent.options.DataChannel.ReplayWindowTime,
 	)

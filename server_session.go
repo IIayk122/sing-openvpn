@@ -299,7 +299,6 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 		true,
 		s.selectedCipher,
 		s.selectedAuth,
-		s.server.parent.protocol,
 		s.server.parent.options.DataChannel.ReplayWindow,
 		s.server.parent.options.DataChannel.ReplayWindowTime,
 	)

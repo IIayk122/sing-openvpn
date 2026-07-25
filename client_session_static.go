@@ -40,7 +40,6 @@ func newStaticKeyClientSession(parent *Client, remote clientRemote) (*staticKeyC
 		return nil, err
 	}
 	replayWindowSize, replayWindowTime := dataReplayWindowParameters(
-		remote.remote.Protocol,
 		parent.options.DataChannel.ReplayWindow,
 		parent.options.DataChannel.ReplayWindowTime,
 	)
@@ -259,10 +258,18 @@ func (s *staticKeyClientSession) readLoop() {
 				continue
 			}
 			authenticatedPacketReceived = true
-			if bytes.Equal(decodedPayload, openVPNDataChannelPingPayload) {
+			framedPayload, framingComplete, framingError := s.parent.decodeIncomingDataFraming(decodedPayload)
+			if framingError != nil {
+				s.parent.dataPlane.incomingPacketDropLog.Log(framingError)
 				continue
 			}
-			decodedPayloads = append(decodedPayloads, decodedPayload)
+			if !framingComplete {
+				continue
+			}
+			if bytes.Equal(framedPayload, openVPNDataChannelPingPayload) {
+				continue
+			}
+			decodedPayloads = append(decodedPayloads, framedPayload)
 		}
 		buf.ReleaseMulti(rawPacketBuffers)
 		if authenticatedPacketReceived {

@@ -13,6 +13,7 @@ import (
 type tlsPeerHooks struct {
 	outgoingDataPayloads     func(payloads [][]byte, codec dataCodec, packetHeaderSize int) ([][][]byte, error)
 	outgoingDataBuffers      func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) ([][]*buf.Buffer, error)
+	decodeIncomingFraming    func(payload *buf.Buffer) (*buf.Buffer, bool, error)
 	deliverIncomingPayloads  func(payloads [][]byte, codec dataCodec, packetHeaderSize int)
 	deliverIncomingBuffers   func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int)
 	incomingPacketHeadroom   int
@@ -140,6 +141,24 @@ func (s *tlsPeerSession) handleIncomingDataPackets(packets []*proto.Packet) {
 		}
 		if readActivityObserver != nil {
 			readActivityObserver()
+		}
+		// Upstream process_incoming_link_part2 reassembles fragments and
+		// decompresses before is_ping_msg and is_occ_msg, and ping.c and occ.c
+		// hand their payloads to encrypt_sign with comp_frag enabled, so both
+		// carry client data framing.
+		if s.hooks.decodeIncomingFraming != nil {
+			var framingComplete bool
+			var framingErr error
+			decodedPayload, framingComplete, framingErr = s.hooks.decodeIncomingFraming(decodedPayload)
+			if framingErr != nil {
+				if s.hooks.logDroppedIncomingPacket != nil {
+					s.hooks.logDroppedIncomingPacket(framingErr)
+				}
+				continue
+			}
+			if !framingComplete {
+				continue
+			}
 		}
 		if bytes.Equal(decodedPayload.Bytes(), openVPNDataChannelPingPayload) {
 			flushDecodedPayloads()

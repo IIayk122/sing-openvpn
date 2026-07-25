@@ -209,7 +209,6 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 		true,
 		s.selectedCipher,
 		s.selectedAuth,
-		s.server.parent.protocol,
 		s.server.parent.options.DataChannel.ReplayWindow,
 		s.server.parent.options.DataChannel.ReplayWindowTime,
 	)
