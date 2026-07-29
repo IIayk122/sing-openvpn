@@ -50,13 +50,14 @@ func (p *tlsServerPinger) runLoop(ctx context.Context) {
 			_ = p.session.Close()
 			return
 		}
+		// Upstream check_ping_send_dowork (ping.c) only queues the keepalive on
+		// the link, so a failed link write leaves the session to --ping-restart
+		// above, which measures inbound silence alone.
 		if p.pingInterval > 0 && now.Sub(lastOutbound) >= p.pingInterval {
-			writeErr := p.session.tryWriteDataPacket(openVPNDataChannelPingPayload)
-			if writeErr != nil {
-				_ = p.session.Close()
-				return
+			messages := p.session.dataChannelMessages()
+			if messages != nil {
+				messages.sendPing()
 			}
-			p.markActivity(false, true)
 		}
 	}
 }

@@ -137,10 +137,7 @@ func (s *Server) WriteDataPacketsByDestination(packets [][]byte) ([]*RouteMissEr
 		return nil, err
 	}
 	var routeMisses []*RouteMissError
-	var routeLookups []peerRouteLookup
-	if s.routes != nil {
-		routeLookups = s.routes.LookupPackets(packets)
-	}
+	routeLookups := s.routes.LookupPackets(packets)
 	var currentRoute peerRoute
 	currentPackets := make([][]byte, 0, len(packets))
 	flushCurrentBatch := func() error {
@@ -157,22 +154,13 @@ func (s *Server) WriteDataPacketsByDestination(packets [][]byte) ([]*RouteMissEr
 		return writeErr
 	}
 	for i, packet := range packets {
-		var route peerRoute
-		var destination netip.Addr
-		var found bool
-		if routeLookups != nil {
-			route = routeLookups[i].route
-			destination = routeLookups[i].destination
-			found = routeLookups[i].found
-		} else {
-			destination, _ = destinationFromIPPacket(packet)
-		}
-		if !found {
+		route := routeLookups[i].route
+		if !routeLookups[i].found {
 			err = flushCurrentBatch()
 			if err != nil {
 				return routeMisses, err
 			}
-			packetRouteErr := newRouteMissError(destination, packet)
+			packetRouteErr := newRouteMissError(routeLookups[i].destination, packet)
 			routeMiss, isRouteMiss := packetRouteErr.(*RouteMissError)
 			if !isRouteMiss {
 				return routeMisses, packetRouteErr
@@ -209,10 +197,7 @@ func (s *Server) WriteDataPacketBuffersByDestination(packetBuffers []*buf.Buffer
 		packets[i] = packetBuffer.Bytes()
 	}
 	var routeMisses []*RouteMissError
-	var routeLookups []peerRouteLookup
-	if s.routes != nil {
-		routeLookups = s.routes.LookupPackets(packets)
-	}
+	routeLookups := s.routes.LookupPackets(packets)
 	var currentRoute peerRoute
 	currentPacketBuffers := make([]*buf.Buffer, 0, len(packetBuffers))
 	flushCurrentBatch := func() error {
@@ -229,25 +214,15 @@ func (s *Server) WriteDataPacketBuffersByDestination(packetBuffers []*buf.Buffer
 		return writeErr
 	}
 	for i, packetBuffer := range packetBuffers {
-		packet := packetBuffer.Bytes()
-		var route peerRoute
-		var destination netip.Addr
-		var found bool
-		if routeLookups != nil {
-			route = routeLookups[i].route
-			destination = routeLookups[i].destination
-			found = routeLookups[i].found
-		} else {
-			destination, _ = destinationFromIPPacket(packet)
-		}
-		if !found {
+		route := routeLookups[i].route
+		if !routeLookups[i].found {
 			err = flushCurrentBatch()
 			if err != nil {
 				packetBuffer.Release()
 				buf.ReleaseMulti(packetBuffers[i+1:])
 				return routeMisses, err
 			}
-			packetRouteErr := newRouteMissError(destination, packet)
+			packetRouteErr := newRouteMissError(routeLookups[i].destination, packetBuffer.Bytes())
 			packetBuffer.Release()
 			routeMiss, isRouteMiss := packetRouteErr.(*RouteMissError)
 			if !isRouteMiss {
@@ -324,17 +299,14 @@ func (s *Server) pushIncomingDataBuffers(packetBuffers []ServerDataBuffer) {
 
 func (s *Server) prepareServerDataPlane() error {
 	if s.static != nil {
-		if s.routes == nil {
-			s.routes = newPeerRouteRegistry()
-		}
-		return nil
-	}
-	if len(s.options.Tunnel.AddressPools) == 0 && len(s.options.Tunnel.LocalAddress) == 0 {
 		return nil
 	}
 	pool, err := newIPPool(s.options.Tunnel.AddressPools, s.options.Tunnel.Topology)
 	if err != nil {
 		return err
+	}
+	if !pool.HasIPv4() && !pool.HasIPv6() {
+		return nil
 	}
 	if pool.HasIPv4() {
 		ipv4Prefix, ipv4PrefixLoaded := firstPrefixByFamily(s.options.Tunnel.LocalAddress, true)
@@ -355,9 +327,6 @@ func (s *Server) prepareServerDataPlane() error {
 		}
 	}
 	s.ipPool = pool
-	if s.routes == nil {
-		s.routes = newPeerRouteRegistry()
-	}
 	return nil
 }
 
@@ -373,10 +342,10 @@ func firstPrefixByFamily(prefixes []netip.Prefix, ipv4 bool) (netip.Prefix, bool
 	return netip.Prefix{}, false
 }
 
-func (s *tlsServerSession) outgoingDataPayloads(payloads [][]byte, codec dataCodec, packetHeaderSize int) ([][][]byte, error) {
+func (s *tlsServerSession) outgoingDataPayloads(payloads [][]byte, codec dataCodec, packetHeaderSize int) [][][]byte {
 	parent := s.server.parent
 	dataChannelOptions := parent.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		nil,
@@ -384,20 +353,17 @@ func (s *tlsServerSession) outgoingDataPayloads(payloads [][]byte, codec dataCod
 		packetHeaderSize,
 		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
 	)
-	if err != nil {
-		return nil, err
-	}
 	outgoingPayloads := make([][][]byte, len(payloads))
 	for i, payload := range payloads {
-		outgoingPayloads[i] = [][]byte{append([]byte{}, clampTCPSegmentMSS(payload, maximumSegmentSize)...)}
+		outgoingPayloads[i] = [][]byte{append([]byte{}, clamp.Apply(payload)...)}
 	}
-	return outgoingPayloads, nil
+	return outgoingPayloads
 }
 
-func (s *tlsServerSession) outgoingDataBuffers(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) ([][]*buf.Buffer, error) {
+func (s *tlsServerSession) outgoingDataBuffers(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) [][]*buf.Buffer {
 	parent := s.server.parent
 	dataChannelOptions := parent.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		nil,
@@ -405,22 +371,47 @@ func (s *tlsServerSession) outgoingDataBuffers(payloads []*buf.Buffer, codec dat
 		packetHeaderSize,
 		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
 	)
-	if err != nil {
-		buf.ReleaseMulti(payloads)
-		return nil, err
-	}
 	outgoingPayloads := make([][]*buf.Buffer, len(payloads))
 	for i, payload := range payloads {
-		clampTCPSegmentMSSInPlace(payload.Bytes(), maximumSegmentSize)
+		clamp.ApplyInPlace(payload.Bytes())
 		outgoingPayloads[i] = []*buf.Buffer{payload}
 	}
-	return outgoingPayloads, nil
+	return outgoingPayloads
+}
+
+// multi.c matches a peer's source address against the virtual addresses
+// multi_client_connect_late_setup() learned from --ifconfig-pool.  A server that
+// hands out no address has no such table to match against: upstream runs that
+// configuration as a point-to-point --tls-server, which writes every decrypted
+// payload to the tun device whatever its source.
+func (s *tlsServerSession) acceptIncomingSources(payloads [][]byte) []bool {
+	parent := s.server.parent
+	accepted := make([]bool, len(payloads))
+	if parent.ipPool == nil {
+		for i := range accepted {
+			accepted[i] = true
+		}
+		return accepted
+	}
+	ownerships := parent.routes.SourcesOwnedBy(payloads, s.tlsPeerSession)
+	for i, ownership := range ownerships {
+		accepted[i] = ownership.owned
+		if ownership.owned {
+			continue
+		}
+		if ownership.sourceAddress.IsValid() {
+			parent.incomingPacketDropLog.LogMessage("bad source address from client ", s.peerAddress, " [", ownership.sourceAddress, "]")
+		} else {
+			parent.incomingPacketDropLog.LogMessage("malformed IP packet from client ", s.peerAddress)
+		}
+	}
+	return accepted
 }
 
 func (s *tlsServerSession) deliverIncomingPayloads(payloads [][]byte, codec dataCodec, packetHeaderSize int) {
 	parent := s.server.parent
 	dataChannelOptions := parent.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		nil,
@@ -428,24 +419,15 @@ func (s *tlsServerSession) deliverIncomingPayloads(payloads [][]byte, codec data
 		packetHeaderSize,
 		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
 	)
-	if err != nil {
-		parent.incomingPacketDropLog.Log(err)
-		return
-	}
 	packets := make([]ServerDataPacket, 0, len(payloads))
-	ownerships := parent.routes.SourcesOwnedBy(payloads, s.tlsPeerSession)
+	accepted := s.acceptIncomingSources(payloads)
 	for i, payload := range payloads {
-		if !ownerships[i].owned {
-			if ownerships[i].sourceAddress.IsValid() {
-				parent.incomingPacketDropLog.LogMessage("bad source address from client ", s.peerAddress, " [", ownerships[i].sourceAddress, "]")
-			} else {
-				parent.incomingPacketDropLog.LogMessage("malformed IP packet from client ", s.peerAddress)
-			}
+		if !accepted[i] {
 			continue
 		}
 		packets = append(packets, ServerDataPacket{
 			PeerAddress: s.peerAddress,
-			Payload:     clampTCPSegmentMSS(payload, maximumSegmentSize),
+			Payload:     clamp.Apply(payload),
 		})
 	}
 	parent.pushIncomingDataPackets(packets)
@@ -454,7 +436,7 @@ func (s *tlsServerSession) deliverIncomingPayloads(payloads [][]byte, codec data
 func (s *tlsServerSession) deliverIncomingBuffers(payloadBuffers []*buf.Buffer, codec dataCodec, packetHeaderSize int) {
 	parent := s.server.parent
 	dataChannelOptions := parent.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		nil,
@@ -462,28 +444,18 @@ func (s *tlsServerSession) deliverIncomingBuffers(payloadBuffers []*buf.Buffer, 
 		packetHeaderSize,
 		openVPNOuterTransportOverhead(parent.protocol, s.packetConnection.RemoteAddr()),
 	)
-	if err != nil {
-		parent.incomingPacketDropLog.Log(err)
-		buf.ReleaseMulti(payloadBuffers)
-		return
-	}
 	payloads := make([][]byte, len(payloadBuffers))
 	for i, payloadBuffer := range payloadBuffers {
 		payloads[i] = payloadBuffer.Bytes()
 	}
 	packetBuffers := make([]ServerDataBuffer, 0, len(payloadBuffers))
-	ownerships := parent.routes.SourcesOwnedBy(payloads, s.tlsPeerSession)
+	accepted := s.acceptIncomingSources(payloads)
 	for i, payloadBuffer := range payloadBuffers {
-		if !ownerships[i].owned {
-			if ownerships[i].sourceAddress.IsValid() {
-				parent.incomingPacketDropLog.LogMessage("bad source address from client ", s.peerAddress, " [", ownerships[i].sourceAddress, "]")
-			} else {
-				parent.incomingPacketDropLog.LogMessage("malformed IP packet from client ", s.peerAddress)
-			}
+		if !accepted[i] {
 			payloadBuffer.Release()
 			continue
 		}
-		clampTCPSegmentMSSInPlace(payloadBuffer.Bytes(), maximumSegmentSize)
+		clamp.ApplyInPlace(payloadBuffer.Bytes())
 		packetBuffers = append(packetBuffers, ServerDataBuffer{
 			PeerAddress: s.peerAddress,
 			Buffer:      payloadBuffer,

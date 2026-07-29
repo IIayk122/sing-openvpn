@@ -33,7 +33,13 @@ func (c *blackholeWriteConnection) Write(payload []byte) (int, error) {
 	return c.Conn.Write(payload)
 }
 
+const (
+	clientBlackholedPingRestart = 3 * time.Second
+	serverReclaimPingRestart    = 5 * time.Second
+)
+
 func TestTLSServerPingMaintainsAndReclaimsUDPSession(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelServerContext()
@@ -49,7 +55,7 @@ func TestTLSServerPingMaintainsAndReclaimsUDPSession(t *testing.T) {
 		},
 		Timing: ServerTimingOptions{
 			PingInterval: time.Second,
-			PingRestart:  8 * time.Second,
+			PingRestart:  serverReclaimPingRestart,
 		},
 		Tunnel: ServerTunnelOptions{
 			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.8.0.0/29")},
@@ -94,7 +100,7 @@ func TestTLSServerPingMaintainsAndReclaimsUDPSession(t *testing.T) {
 		Pull: ClientPullOptions{Enabled: true},
 		Timing: ClientTimingOptions{
 			PingInterval: time.Second,
-			PingRestart:  5 * time.Second,
+			PingRestart:  clientBlackholedPingRestart,
 		},
 	})
 	if err != nil {
@@ -112,11 +118,11 @@ func TestTLSServerPingMaintainsAndReclaimsUDPSession(t *testing.T) {
 	}
 	blackholedConnection.dropWrites.Store(true)
 
-	time.Sleep(5500 * time.Millisecond)
+	time.Sleep(clientBlackholedPingRestart + 500*time.Millisecond)
 	if !firstClient.Ready() {
 		t.Fatalf("client lost readiness while server pings should keep it alive: reads=%d dials=%d", blackholedConnection.readCount.Load(), dialCount.Load())
 	}
-	time.Sleep(4500 * time.Millisecond)
+	time.Sleep(serverReclaimPingRestart - clientBlackholedPingRestart + 1500*time.Millisecond)
 
 	secondClientContext, cancelSecondClientContext := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelSecondClientContext()
@@ -132,7 +138,7 @@ func TestTLSServerPingMaintainsAndReclaimsUDPSession(t *testing.T) {
 		Pull: ClientPullOptions{Enabled: true},
 		Timing: ClientTimingOptions{
 			PingInterval: time.Second,
-			PingRestart:  5 * time.Second,
+			PingRestart:  clientBlackholedPingRestart,
 		},
 	})
 	if err != nil {

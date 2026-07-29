@@ -176,7 +176,11 @@ type ServerTransportOptions struct {
 }
 
 type ServerResourceOptions struct {
-	MaxClients int
+	MaxClients                    int
+	ConnectFrequency              int
+	ConnectFrequencyPeriod        time.Duration
+	InitialConnectFrequency       int
+	InitialConnectFrequencyPeriod time.Duration
 }
 
 type ServerDataChannelOptions struct {

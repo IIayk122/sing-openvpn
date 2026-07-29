@@ -2,7 +2,7 @@ package test
 
 import (
 	"context"
-	"io"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -20,7 +20,8 @@ type tlsStartupGateConn struct {
 	holdFirstClose bool
 
 	readAccess       sync.Mutex
-	readCount        int
+	pendingStream    []byte
+	resetHeld        bool
 	resetRead        chan struct{}
 	releaseResetRead chan struct{}
 	resetReadOnce    sync.Once
@@ -42,22 +43,49 @@ func newTLSStartupGateConn(connection net.Conn, holdFirstClose bool) *tlsStartup
 	}
 }
 
+// The gate holds the session between the encapsulated packet its peer opens
+// with and the reader that consumes it, so it counts encapsulated packets
+// instead of reads: how a reader slices the stream into reads is its own.
 func (c *tlsStartupGateConn) Read(buffer []byte) (int, error) {
 	c.readAccess.Lock()
-	c.readCount++
-	readCount := c.readCount
-	c.readAccess.Unlock()
-	if readCount > 2 {
-		return c.Conn.Read(buffer)
-	}
-	readLength, err := io.ReadFull(c.Conn, buffer)
-	if readCount == 2 && err == nil {
+	defer c.readAccess.Unlock()
+	if !c.resetHeld {
+		err := c.bufferResetPacket()
+		if err != nil {
+			return 0, err
+		}
+		c.resetHeld = true
 		c.resetReadOnce.Do(func() {
 			close(c.resetRead)
 		})
 		<-c.releaseResetRead
 	}
-	return readLength, err
+	if len(c.pendingStream) > 0 {
+		readLength := copy(buffer, c.pendingStream)
+		c.pendingStream = c.pendingStream[readLength:]
+		return readLength, nil
+	}
+	return c.Conn.Read(buffer)
+}
+
+func (c *tlsStartupGateConn) bufferResetPacket() error {
+	readBuffer := make([]byte, 65535)
+	for {
+		if len(c.pendingStream) >= 2 {
+			packetLength := int(binary.BigEndian.Uint16(c.pendingStream[:2]))
+			if len(c.pendingStream) >= 2+packetLength {
+				return nil
+			}
+		}
+		readLength, err := c.Conn.Read(readBuffer)
+		if readLength > 0 {
+			c.pendingStream = append(c.pendingStream, readBuffer[:readLength]...)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 func (c *tlsStartupGateConn) Write(buffer []byte) (int, error) {
@@ -104,6 +132,7 @@ func (l *tlsStartupGateListener) Accept() (net.Conn, error) {
 }
 
 func TestTLSClientClosePreventsLateControlChannelStart(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelServerContext()
@@ -182,6 +211,7 @@ func TestTLSClientClosePreventsLateControlChannelStart(t *testing.T) {
 }
 
 func TestTLSClientContextCancellationPreventsLateControlChannelStart(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelServerContext()
@@ -254,6 +284,7 @@ func TestTLSClientContextCancellationPreventsLateControlChannelStart(t *testing.
 }
 
 func TestTLSClientCloseRacesSessionPublication(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelServerContext()
@@ -330,6 +361,7 @@ func TestTLSClientCloseRacesSessionPublication(t *testing.T) {
 }
 
 func TestTLSServerClosePreventsLateControlChannelStart(t *testing.T) {
+	t.Parallel()
 	rawListener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

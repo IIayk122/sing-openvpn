@@ -29,22 +29,12 @@ const (
 	openVPNLZOAdaptiveSavePercent    = 5
 )
 
-func isLZOCompressionEnabled(compression string, compressionLZO string) bool {
-	switch compressionLZO {
-	case "yes", "adaptive", "asym", "no":
-		// Upstream options_postprocess_compression still enables
-		// single-byte LZO stub framing for comp-lzo no.
-		return true
-	}
-	return false
-}
-
 func (f *dataChannelFraming) encodeLZOFrame(payload []byte) []byte {
-	if !f.compressionLZOOutbound || len(payload) < openVPNCompressionThreshold || !f.lzoCompressionEnabled(time.Now()) {
+	if !f.compressOutbound || len(payload) < openVPNCompressionThreshold || !f.lzoCompressionEnabled(time.Now()) {
 		return append([]byte{openVPNNoCompressByte}, payload...)
 	}
 	compressedPayload := compressLZOBlock(payload)
-	if f.compressionLZOAdaptive {
+	if f.compression.adaptive {
 		f.recordLZOCompression(len(payload), len(compressedPayload))
 	}
 	if len(compressedPayload) >= len(payload) {
@@ -53,8 +43,40 @@ func (f *dataChannelFraming) encodeLZOFrame(payload []byte) []byte {
 	return append([]byte{openVPNLZOCompressByte}, compressedPayload...)
 }
 
+// Upstream lzo_decompress (lzo.c) accepts only the plain no-compress marker
+// and the LZO marker; every other head byte drops the packet.
+func decodeLZOFrame(framedPayload []byte) ([]byte, error) {
+	if len(framedPayload) == 0 {
+		return nil, E.New("missing compression marker")
+	}
+	switch framedPayload[0] {
+	case openVPNNoCompressByte:
+		return framedPayload[1:], nil
+	case openVPNLZOCompressByte:
+		return decompressLZOBlock(framedPayload[1:])
+	default:
+		return nil, E.New("invalid lzo compression marker")
+	}
+}
+
+// Upstream lz4_decompress (lz4.c) unswaps the head byte and accepts only the
+// swapped no-compress marker and the LZ4 marker.
+func decodeLZ4V1Frame(framedPayload []byte) ([]byte, error) {
+	if len(framedPayload) == 0 {
+		return nil, E.New("missing compression marker")
+	}
+	switch framedPayload[0] {
+	case openVPNNoCompressByteSwap:
+		return unswapV1FrameHead(framedPayload), nil
+	case openVPNLZ4CompressByte:
+		return decompressLZ4V1Frame(framedPayload)
+	default:
+		return nil, E.New("invalid lz4 compression marker")
+	}
+}
+
 func (f *dataChannelFraming) lzoCompressionEnabled(now time.Time) bool {
-	if !f.compressionLZOAdaptive {
+	if !f.compression.adaptive {
 		return true
 	}
 	f.access.Lock()
@@ -124,7 +146,7 @@ func (f *dataChannelFraming) unwrapV2Compression(payload []byte) ([]byte, error)
 	case openVPNCompressV2SubTypeNone:
 		return payload[2:], nil
 	case openVPNCompressV2SubTypeLZ4:
-		if !f.compressionLZ4V2 {
+		if f.compression.algorithm != compressionAlgorithmLZ4V2 {
 			return nil, E.New("compressed lz4 v2 payload is not supported")
 		}
 		return decompressLZ4Block(payload[2:])
@@ -133,8 +155,13 @@ func (f *dataChannelFraming) unwrapV2Compression(payload []byte) ([]byte, error)
 	}
 }
 
-// Upstream lz4_compress preserves LZ4 framing by using swap-stub packets.
-func applyLZ4V1NoCompressFrame(payload []byte) []byte {
+// Upstream stub_compress (compstub.c) moves the head byte to the tail and
+// writes the swapped marker under COMP_F_SWAP, and prepends the plain marker
+// otherwise.
+func applyStubCompressionFrame(payload []byte, swap bool) []byte {
+	if !swap {
+		return append([]byte{openVPNNoCompressByte}, payload...)
+	}
 	if len(payload) == 0 {
 		return []byte{openVPNNoCompressByteSwap}
 	}
@@ -143,6 +170,24 @@ func applyLZ4V1NoCompressFrame(payload []byte) []byte {
 	copy(framedPayload[1:], payload[1:])
 	framedPayload[len(payload)] = payload[0]
 	return framedPayload
+}
+
+// Upstream stub_decompress (compstub.c) accepts only the marker matching the
+// configured COMP_F_SWAP framing.
+func unframeStubCompression(framedPayload []byte, swap bool) ([]byte, error) {
+	if len(framedPayload) == 0 {
+		return nil, E.New("missing compression marker")
+	}
+	if !swap {
+		if framedPayload[0] != openVPNNoCompressByte {
+			return nil, E.New("invalid compression stub marker")
+		}
+		return framedPayload[1:], nil
+	}
+	if framedPayload[0] != openVPNNoCompressByteSwap {
+		return nil, E.New("invalid compression stub marker")
+	}
+	return unswapV1FrameHead(framedPayload), nil
 }
 
 // Upstream lz4_decompress restores the swapped head byte from the tail.

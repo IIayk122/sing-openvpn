@@ -15,6 +15,7 @@ import (
 )
 
 func TestTLSLoopbackDataPlaneRoutesByDestination(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelServerContext()
@@ -156,6 +157,7 @@ func TestTLSLoopbackDataPlaneRoutesByDestination(t *testing.T) {
 }
 
 func TestTLSLoopbackPushDNSEmitsDHCPOptionAndPromotesTypedDNS(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelServerContext()
@@ -242,6 +244,7 @@ func TestTLSLoopbackPushDNSEmitsDHCPOptionAndPromotesTypedDNS(t *testing.T) {
 }
 
 func TestServerUDPTransportInjectionAndAuthenticator(t *testing.T) {
+	t.Parallel()
 	packetConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

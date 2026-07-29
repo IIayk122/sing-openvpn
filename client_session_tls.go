@@ -59,6 +59,7 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 			protection:              protection,
 			wrappedClientKey:        wrappedClientKey,
 			dataTransportHeaderSize: dataTransportHeaderSize(remote.remote.Protocol),
+			handshakeWindow:         parent.options.Timing.HandWindow,
 		},
 		parent:             parent,
 		remote:             remote,
@@ -97,8 +98,8 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 				remoteSessionID,
 			), nil
 		},
-		renegotiate: func(_ *tlsPeerSession, channel *tlsControlChannel, initiator bool) (dataCodec, error) {
-			return client.runRenegotiation(channel, initiator)
+		renegotiate: func(_ *tlsPeerSession, channel *tlsControlChannel, mustNegotiate time.Time) (dataCodec, error) {
+			return client.runRenegotiation(channel, mustNegotiate)
 		},
 		onRenegotiated: func(_ *tlsPeerSession, keyID uint8) {
 			if client.keepalive != nil {
@@ -107,10 +108,10 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 		},
 	}
 	client.hooks = tlsPeerHooks{
-		outgoingDataPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) ([][][]byte, error) {
+		outgoingDataPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) [][][]byte {
 			return client.parent.outgoingDataPayloadBatches(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
 		},
-		outgoingDataBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) ([][]*buf.Buffer, error) {
+		outgoingDataBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) [][]*buf.Buffer {
 			return client.parent.outgoingDataBufferBatches(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
 		},
 		decodeIncomingFraming: client.parent.decodeIncomingDataFramingBuffer,
@@ -227,26 +228,43 @@ func (c *tlsClient) Start() error {
 	if c.packetConnection == nil || c.sessionContext == nil {
 		return ErrDataChannelNotReady
 	}
-	// Upstream session_move_pre_start/S_ACTIVE (ssl.c) uses one
-	// hand-window deadline for HARD_RESET and TLS negotiation.
-	handshakeDeadline := time.Now().Add(c.parent.options.Timing.HandWindow)
+	// Upstream tls_process (ssl.c) bounds the whole S_INITIAL..S_ACTIVE
+	// exchange with the key_state's must_negotiate stamp, so the HARD_RESET
+	// round trip, the TLS negotiation and the key-method exchange share one
+	// hand-window deadline.
+	handshakeDeadline := time.Now().Add(c.handshakeWindow)
 	serverResetPacket, err := c.handshakeReset(handshakeDeadline)
 	if err != nil {
 		_ = c.Close()
 		return err
 	}
 
+	// Upstream process_incoming_link_part1 (forward.c) resets ping_rec_interval
+	// whenever tls_pre_decrypt accepts a control channel packet, and
+	// process_outgoing_link resets ping_send_interval for every packet written
+	// to the link, so the whole session shares one liveness clock which control
+	// traffic keeps alive while the data channel is idle.
+	keepalive := &tlsClientKeepalive{
+		session: c,
+		parent:  c.parent,
+	}
+	keepalive.markActivity(true, true)
+	c.keepalive = keepalive
+
 	controlChannel := newTLSControlChannel(
 		c.packetConnection,
 		c.sessionManager,
 		c.protection,
 		c.handleIncomingDataPackets,
-		c.handleIncomingHardReset,
 		c.tlsPeerSession.handleIncomingSoftReset,
 	)
 	if c.resendWrappedClientKey {
 		controlChannel.wrappedClientKey = append([]byte{}, c.wrappedClientKey...)
 	}
+	controlChannel.setActivityObservers(
+		func() { keepalive.markActivity(true, false) },
+		func() { keepalive.markActivity(false, true) },
+	)
 	controlChannel.seedIncomingPacket(serverResetPacket)
 	tlsConnection := tls.Client(controlChannel, c.tlsConfiguration)
 	if !c.installInitialControlChannel(controlChannel, tlsConnection) {
@@ -272,7 +290,7 @@ func (c *tlsClient) Start() error {
 	}
 	_ = tlsConnection.SetDeadline(time.Time{})
 
-	err = c.exchangeKeyMethod()
+	err = c.exchangeKeyMethod(handshakeDeadline)
 	if err != nil {
 		_ = c.Close()
 		return err
@@ -316,30 +334,27 @@ func (c *tlsClient) Start() error {
 	}
 	c.remoteSelectedCipher = selectedCipher
 	c.remoteSelectedAuth = selectedAuth
-	c.keepalive = &tlsClientKeepalive{
-		session:         c,
-		parent:          c.parent,
-		writeDataPacket: c.WriteDataPacket,
-	}
-	c.keepalive.configureRenegotiation(selectedCipher, c.sessionManager.CurrentKeyID())
+	keepalive.configureRenegotiation(selectedCipher, c.sessionManager.CurrentKeyID())
 	c.setDataObservers(
-		c.keepalive.consumeOutboundRenegotiationBudget,
-		c.keepalive.consumeInboundRenegotiationCounter,
-		c.keepalive.consumeInboundRenegotiationUsage,
-		func() { c.keepalive.markActivity(true, false) },
-		c.keepalive.registerInactivityBytes,
-		func() { c.keepalive.markActivity(false, true) },
-		c.keepalive.registerInactivityBytes,
+		keepalive.consumeOutboundRenegotiationBudget,
+		keepalive.consumeInboundRenegotiationCounter,
+		keepalive.consumeInboundRenegotiationUsage,
+		func() { keepalive.markActivity(true, false) },
+		keepalive.registerInactivityBytes,
+		func() { keepalive.markActivity(false, true) },
+		keepalive.registerInactivityBytes,
 	)
-	c.keepalive.noteSessionStart()
-	c.keepalive.markActivity(true, true)
-	c.keepalive.resetInactivityTimer()
-	c.keepalive.refreshFromTunnelConfiguration()
+	keepalive.noteSessionStart()
+	// Upstream do_up (init.c) re-runs do_init_timers once the pulled options are
+	// applied, so the tunnel start restamps the liveness clock.
+	keepalive.markActivity(true, true)
+	keepalive.resetInactivityTimer()
+	keepalive.refreshFromTunnelConfiguration()
 	c.installInitialDataCodec(initialCodec, c.sessionManager.CurrentKeyID())
 	c.setReady(true)
 	c.parent.emitTunnelConfigurationEvent(TunnelConfigurationEventInitial)
 	go c.controlMessageLoop()
-	go c.keepalive.runLoop()
+	go keepalive.runLoop()
 	return nil
 }
 
@@ -473,24 +488,16 @@ func (c *tlsClient) parseIncomingHandshakePacket(rawPacket []byte) (*proto.Packe
 	opcode := proto.Opcode(rawPacket[0] >> 3)
 	packetBytes := rawPacket
 	if isControlOrAcknowledgmentOpcode(opcode) {
-		if c.protection.crypt != nil {
-			decodedPacket, decoded := c.protection.crypt.decodeControlPacket(rawPacket)
-			if !decoded {
-				return nil, E.New("invalid tls control packet")
-			}
-			packetBytes = decodedPacket
-		} else if c.protection.auth != nil {
-			decodedPacket, decoded := c.protection.auth.decodeControlPacket(rawPacket)
-			if !decoded {
-				return nil, E.New("invalid tls auth packet")
-			}
-			packetBytes = decodedPacket
+		decodedPacket, err := c.protection.decodeIncomingControlPacket(rawPacket)
+		if err != nil {
+			return nil, err
 		}
+		packetBytes = decodedPacket
 	}
 	return proto.ParsePacket(packetBytes)
 }
 
-func (c *tlsClient) exchangeKeyMethod() error {
+func (c *tlsClient) exchangeKeyMethod(mustNegotiate time.Time) error {
 	clientKeySource, err := generateTLSKeyMethodKeySource(true)
 	if err != nil {
 		return err
@@ -504,8 +511,7 @@ func (c *tlsClient) exchangeKeyMethod() error {
 		c.remote.remote.Protocol,
 		true,
 		c.parent.options.TLS.Auth.IsSet(),
-		c.parent.options.DataChannel.Compression,
-		c.parent.options.DataChannel.CompressionLZO,
+		c.parent.dataPlane.compression,
 		tlsPreferredCipher(c.parent.options),
 		selectedAuth,
 		c.parent.options.DataChannel.MTU,
@@ -526,8 +532,11 @@ func (c *tlsClient) exchangeKeyMethod() error {
 	if err != nil {
 		return err
 	}
-	controlRecord, err := readTLSControlRecord(c.tlsConnection, 5*time.Second)
+	controlRecord, err := readTLSControlRecord(c.tlsConnection, mustNegotiate)
 	if err != nil {
+		if E.IsTimeout(err) {
+			return E.Extend(ErrHandshakeTimeout, "key method exchange")
+		}
 		return err
 	}
 	if isAuthFailedPayload(controlRecord) {
@@ -544,7 +553,7 @@ func (c *tlsClient) exchangeKeyMethod() error {
 }
 
 func (c *tlsClient) configureP2PDataChannel() (string, string, error) {
-	selectedCipher, err := selectP2PCipher(c.parent.options, c.peerInfo, c.remoteCipherName)
+	selectedCipher, err := selectP2PCipher(c.parent.options, c.peerInfo)
 	if err != nil {
 		return "", "", err
 	}
@@ -576,11 +585,9 @@ func (c *tlsClient) p2pUsesKeyMaterialExport() bool {
 
 // Upstream tls_process (ssl.c) keeps the client key-method order during
 // soft reset.
-func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool) (dataCodec, error) {
-	_ = initiator
+func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, mustNegotiate time.Time) (dataCodec, error) {
 	tlsConnection := tls.Client(channel, c.tlsConfiguration)
-	deadline := time.Now().Add(c.parent.options.Timing.HandWindow)
-	deadlineErr := tlsConnection.SetDeadline(deadline)
+	deadlineErr := tlsConnection.SetDeadline(mustNegotiate)
 	if deadlineErr != nil {
 		return nil, deadlineErr
 	}
@@ -608,8 +615,11 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 	if writeErr != nil {
 		return nil, writeErr
 	}
-	controlRecord, err := readTLSControlRecord(tlsConnection, time.Until(deadline))
+	controlRecord, err := readTLSControlRecord(tlsConnection, mustNegotiate)
 	if err != nil {
+		if E.IsTimeout(err) {
+			return nil, E.Extend(ErrHandshakeTimeout, "renegotiated key method exchange")
+		}
 		return nil, err
 	}
 	if isAuthFailedPayload(controlRecord) {
@@ -650,30 +660,5 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, initiator bool)
 		return nil, err
 	}
 	_ = tlsConnection.SetDeadline(time.Time{})
-	go c.renegotiationControlMessageLoop(tlsConnection)
 	return newCodec, nil
-}
-
-// Upstream creates a separate TLS control stream for every soft-reset and may
-// send token-only PUSH_REPLY records on the newly active key state.
-func (c *tlsClient) renegotiationControlMessageLoop(tlsConnection *tls.Conn) {
-	for {
-		select {
-		case <-c.sessionContext.Done():
-			return
-		default:
-		}
-		controlRecord, err := readTLSControlRecord(tlsConnection, time.Second)
-		if err != nil {
-			if E.IsTimeout(err) {
-				continue
-			}
-			return
-		}
-		err = c.dispatchControlDirective(controlRecord)
-		if err != nil {
-			c.finish(err)
-			return
-		}
-	}
 }

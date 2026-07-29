@@ -30,6 +30,7 @@ type framedKeepaliveInteropCase struct {
 }
 
 func TestOpenVPNInteropFramedKeepalivePing(t *testing.T) {
+	t.Parallel()
 	testCases := []framedKeepaliveInteropCase{
 		{
 			name: "comp_lzo_yes",
@@ -49,6 +50,7 @@ push "compress stub"`,
 	env := requireInteropEnvironmentVersion(t, "2.6.14")
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(caseTest *testing.T) {
+			caseTest.Parallel()
 			runFramedKeepaliveInteropCase(caseTest, env, testCase)
 		})
 	}
@@ -60,7 +62,7 @@ func runFramedKeepaliveInteropCase(t *testing.T, env interopEnvironment, testCas
 	t.Cleanup(func() {
 		dumpInteropLogs(t, workspace)
 	})
-	serverPort := reserveUDPPort(t)
+	serverPort := reserveInteropPort(t, "udp")
 	serverConfiguration := fmt.Sprintf(`port %d
 proto udp4
 dev tun
@@ -92,7 +94,7 @@ log %s
 		t.Fatalf("write keepalive server config: %v", err)
 	}
 	startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-keepalive-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-keepalive-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"openvpn", "--config", filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "keepalive-server.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},
@@ -102,7 +104,7 @@ log %s
 	serverLogPath := filepath.Join(workspace.logsDir, "keepalive-server.log")
 	waitForLogLine(t, serverLogPath, "Initialization Sequence Completed", 20*time.Second)
 
-	clientPort := reserveUDPPort(t)
+	clientPort := reserveInteropPort(t, "udp")
 	clientContext, cancelClient := context.WithTimeout(context.Background(), 60*time.Second)
 	client, err := openvpn.NewClient(openvpn.ClientOptions{
 		Context: clientContext,

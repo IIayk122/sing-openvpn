@@ -15,12 +15,13 @@ import (
 )
 
 func TestOpenVPNInteropPullFalseP2PData(t *testing.T) {
+	t.Parallel()
 	env := requireInteropEnvironmentVersion(t, openVPNInteropDefaultVersion)
 	workspace := newInteropWorkspace(t)
 	t.Cleanup(func() {
 		dumpInteropLogs(t, workspace)
 	})
-	serverPort := reserveUDPPort(t)
+	serverPort := reserveInteropPort(t, "udp")
 	serverConfiguration := fmt.Sprintf(`port %d
 proto udp4
 dev tun
@@ -49,7 +50,7 @@ log %s
 		t.Fatal(err)
 	}
 	startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-p2p-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-p2p-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"openvpn", "--config", filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "p2p-server.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},
@@ -116,12 +117,13 @@ log %s
 }
 
 func TestOpenVPNInteropLZOCompressedRequest(t *testing.T) {
+	t.Parallel()
 	env := requireInteropEnvironmentVersion(t, openVPNInteropDefaultVersion)
 	workspace := newInteropWorkspace(t)
 	t.Cleanup(func() {
 		dumpInteropLogs(t, workspace)
 	})
-	serverPort := reserveUDPPort(t)
+	serverPort := reserveInteropPort(t, "udp")
 	serverConfiguration := fmt.Sprintf(`port %d
 proto udp4
 dev tun
@@ -152,7 +154,7 @@ log %s
 		t.Fatal(err)
 	}
 	startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-lzo-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-lzo-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"openvpn", "--config", filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "lzo-server.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},
@@ -162,7 +164,7 @@ log %s
 	serverLogPath := filepath.Join(workspace.logsDir, "lzo-server.log")
 	waitForLogLine(t, serverLogPath, "Initialization Sequence Completed", 20*time.Second)
 
-	clientPort := reserveUDPPort(t)
+	clientPort := reserveInteropPort(t, "udp")
 	packetLengthRecorder := new(interopPacketLengthRecorder)
 	clientContext, cancelClient := context.WithTimeout(context.Background(), 30*time.Second)
 	client, err := openvpn.NewClient(openvpn.ClientOptions{

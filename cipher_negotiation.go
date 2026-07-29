@@ -24,11 +24,13 @@ func extractRemoteCipherName(optionsString string) string {
 	return ""
 }
 
-// Upstream check_pull_client_ncp/tls_poor_mans_ncp (ssl_ncp.c) uses
-// data-ciphers-fallback only when the peer OptionsString has no cipher.
-func applyCipherNegotiationFallback(options ClientOptions, remoteCipherName string) (string, error) {
-	trimmedRemote := strings.TrimSpace(remoteCipherName)
+// Upstream check_pull_client_ncp (ssl_ncp.c) runs when the server pushed no
+// cipher: tls_poor_mans_ncp adopts the peer OptionsString cipher only while
+// data-ciphers lists it, data-ciphers-fallback applies only while the peer
+// announced no cipher at all, and every other outcome aborts the session.
+func selectPulledCipher(options ClientOptions, remoteCipherName string) (string, error) {
 	advertisedCiphers := tlsAdvertisedDataCiphers(options.DataChannel.Ciphers)
+	trimmedRemote := strings.TrimSpace(remoteCipherName)
 	if trimmedRemote != "" {
 		for _, candidate := range advertisedCiphers {
 			if strings.EqualFold(candidate, trimmedRemote) {
@@ -45,18 +47,23 @@ func applyCipherNegotiationFallback(options ClientOptions, remoteCipherName stri
 	if options.DataChannel.FallbackCipher != "" {
 		return options.DataChannel.FallbackCipher, nil
 	}
-	return tlsPreferredCipher(options), nil
+	return "", E.Extend(
+		ErrCipherNegotiationFailed,
+		"server pushed no cipher and announced none in its options string",
+		"; set data-ciphers-fallback to connect to this server",
+	)
 }
 
-func selectP2PCipher(options ClientOptions, peerInfo string, remoteCipherName string) (string, error) {
-	peerCiphers, peerCipherListKnown := parsePeerInfoCipherList(peerInfo)
-	if !peerCipherListKnown {
-		return applyCipherNegotiationFallback(options, remoteCipherName)
-	}
+// Upstream get_p2p_ncp_cipher (ssl_ncp.c) negotiates from IV_CIPHERS alone, in
+// the order of the TLS server's list and without consulting the peer
+// OptionsString cipher, and do_deferred_p2p_ncp (init.c) keeps a session whose
+// intersection is empty only while data-ciphers-fallback carries it.
+func selectP2PCipher(options ClientOptions, peerInfo string) (string, error) {
 	localCiphers := tlsAdvertisedDataCiphers(options.DataChannel.Ciphers)
+	peerCiphers, _ := peerInfoIVCipherList(peerInfo)
 	for _, peerCipher := range peerCiphers {
 		for _, localCipher := range localCiphers {
-			if strings.EqualFold(strings.TrimSpace(peerCipher), localCipher) {
+			if strings.EqualFold(peerCipher, localCipher) {
 				return localCipher, nil
 			}
 		}
@@ -64,5 +71,10 @@ func selectP2PCipher(options ClientOptions, peerInfo string, remoteCipherName st
 	if options.DataChannel.FallbackCipher != "" {
 		return options.DataChannel.FallbackCipher, nil
 	}
-	return "", E.Extend(ErrCipherNegotiationFailed, "no shared p2p cipher")
+	return "", E.Extend(
+		ErrCipherNegotiationFailed,
+		"peer announced no data cipher shared with data-ciphers ",
+		strings.Join(localCiphers, ":"),
+		"; set data-ciphers-fallback to connect to this peer",
+	)
 }

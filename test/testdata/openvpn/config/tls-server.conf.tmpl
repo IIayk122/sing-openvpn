@@ -3,13 +3,27 @@ proto {{ .Protocol }}
 dev tun
 topology subnet
 server 10.8.0.0 255.255.255.0
+{{- if .CAPath }}
 ca {{ .CAPath }}
+{{- end }}
 cert {{ .CertPath }}
 key {{ .KeyPath }}
+{{- range .PeerFingerprints }}
+peer-fingerprint {{ . }}
+{{- end }}
 dh none
 persist-key
 persist-tun
 verb 4
+{{- if .NSCertType }}
+ns-cert-type {{ .NSCertType }}
+{{- end }}
+{{- if .VerifyX509Name }}
+verify-x509-name "{{ .VerifyX509Name }}"{{ if .VerifyX509Type }} {{ .VerifyX509Type }}{{ end }}
+{{- end }}
+{{- if .CRLVerifyPath }}
+crl-verify {{ .CRLVerifyPath }}
+{{- end }}
 {{- if .Cipher }}
 cipher {{ .Cipher }}
 {{- end }}
@@ -27,8 +41,10 @@ tun-mtu {{ .TunMTU }}
 {{- if gt .Fragment 0 }}
 fragment {{ .Fragment }}
 {{- end }}
-{{- if gt .MSSFix 0 }}
-mssfix {{ .MSSFix }}
+{{- if .MSSFixDisabled }}
+mssfix 0
+{{- else if gt .MSSFix 0 }}
+mssfix {{ .MSSFix }}{{ if .MSSFixMode }} {{ .MSSFixMode }}{{ end }}
 {{- end }}
 {{- if .Compression }}
 compress {{ .Compression }}

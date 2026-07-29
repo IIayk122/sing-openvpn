@@ -19,6 +19,7 @@ const (
 	tlsControlHeaderLength        = 1 + 8
 	tlsControlPacketIDLength      = 8
 	tlsCryptTagLength             = sha256.Size
+	tlsCryptBlockLength           = aes.BlockSize
 	tlsCryptV2ClientPEMType       = "OpenVPN tls-crypt-v2 client key"
 	tlsCryptV2ServerPEMType       = "OpenVPN tls-crypt-v2 server key"
 	tlsCryptV2ClientKeyDataLength = 256
@@ -30,6 +31,116 @@ const (
 	tlsCryptV2TLVTypeEarlyNegotiationFlags  = 0x0001
 	tlsCryptV2EarlyNegotiationFlagResendWKC = 0x0001
 )
+
+// Upstream struct tls_wrap_ctx carries the tls-crypt-v2 server key next to the
+// control channel keys, so read_control_auth can unwrap the client key of a
+// P_CONTROL_HARD_RESET_CLIENT_V3 or P_CONTROL_WKC_V1 packet on any path that
+// authenticates a control packet.
+type tlsControlProtection struct {
+	auth             *controlAuthCodec
+	crypt            *controlCryptCodec
+	cryptV2ServerKey []byte
+}
+
+// Upstream keeps tls-auth/tls-crypt packet-id and replay state local to each key_state.
+func (p tlsControlProtection) newSessionProtection() tlsControlProtection {
+	return tlsControlProtection{
+		auth:             p.auth.newSessionCodec(),
+		crypt:            p.crypt.newSessionCodec(),
+		cryptV2ServerKey: p.cryptV2ServerKey,
+	}
+}
+
+// Upstream calc_control_channel_frame_overhead books tls_crypt_buf_overhead for
+// a TLS_WRAP_CRYPT session, which counts a cipher block the CTR mode stream
+// never spends, and the HMAC plus the long form packet id for a TLS_WRAP_AUTH
+// one.
+func (p tlsControlProtection) controlPacketOverhead() int {
+	if p.crypt != nil || len(p.cryptV2ServerKey) > 0 {
+		return tlsControlPacketIDLength + tlsCryptTagLength + tlsCryptBlockLength
+	}
+	if p.auth != nil {
+		return p.auth.digestSize + tlsControlPacketIDLength
+	}
+	return 0
+}
+
+func (p tlsControlProtection) encodeOutgoingControlPacket(rawPacket []byte) []byte {
+	if p.crypt != nil {
+		return p.crypt.encodeControlPacket(rawPacket)
+	}
+	if p.auth != nil {
+		return p.auth.encodeControlPacket(rawPacket)
+	}
+	return rawPacket
+}
+
+// Upstream read_control_auth strips the appended wrapped client key before the
+// remainder of the packet is authenticated, whatever state the session is in.
+func (p *tlsControlProtection) decodeIncomingControlPacket(rawPacket []byte) ([]byte, error) {
+	if len(rawPacket) < tlsControlHeaderLength {
+		return nil, E.New("invalid tls control packet")
+	}
+	packetBytes := rawPacket
+	opcode := proto.Opcode(rawPacket[0] >> 3)
+	if opcode == proto.OpcodeControlHardResetClientV3 || opcode == proto.OpcodeControlWKCv1 {
+		strippedPacket, err := p.extractTLSCryptV2ClientKey(rawPacket)
+		if err != nil {
+			return nil, err
+		}
+		packetBytes = strippedPacket
+	}
+	if p.crypt != nil {
+		decodedPacket, decoded := p.crypt.decodeControlPacket(packetBytes)
+		if !decoded {
+			return nil, E.New("invalid tls-crypt packet")
+		}
+		return decodedPacket, nil
+	}
+	if p.auth != nil {
+		decodedPacket, decoded := p.auth.decodeControlPacket(packetBytes)
+		if !decoded {
+			return nil, E.New("invalid tls-auth packet")
+		}
+		return decodedPacket, nil
+	}
+	// A tls-crypt-v2 server holds no control channel key until a wrapped client
+	// key arrives, so upstream tls_crypt_unwrap rejects every other packet.
+	if len(p.cryptV2ServerKey) > 0 {
+		return nil, E.New("missing tls-crypt-v2 wrapped client key")
+	}
+	return packetBytes, nil
+}
+
+// Upstream tls_crypt_v2_extract_client_key ignores the wrapped key of a resent
+// packet once the control channel keys are set up and returns the remaining
+// packet, which turns a resent P_CONTROL_WKC_V1 into a plain P_CONTROL_V1.
+func (p *tlsControlProtection) extractTLSCryptV2ClientKey(rawPacket []byte) ([]byte, error) {
+	if len(p.cryptV2ServerKey) == 0 {
+		return nil, E.New("peer wants tls-crypt-v2 but no server key is present")
+	}
+	if len(rawPacket) < tlsControlHeaderLength+2 {
+		return nil, E.New("invalid tls-crypt-v2 packet")
+	}
+	wrappedKeyLength := int(binary.BigEndian.Uint16(rawPacket[len(rawPacket)-2:]))
+	if wrappedKeyLength < tlsCryptTagLength+2 || wrappedKeyLength > len(rawPacket)-tlsControlHeaderLength {
+		return nil, E.New("invalid tls-crypt-v2 wrapped key")
+	}
+	packetBytes := rawPacket[:len(rawPacket)-wrappedKeyLength]
+	if p.crypt != nil {
+		return packetBytes, nil
+	}
+	clientKeyMaterial, err := unwrapTLSCryptV2ClientKey(rawPacket[len(rawPacket)-wrappedKeyLength:], p.cryptV2ServerKey)
+	if err != nil {
+		return nil, err
+	}
+	cryptCodec, err := newControlCryptCodecFromMaterial(clientKeyMaterial, tlsCryptKeyDirectionNormal)
+	if err != nil {
+		return nil, err
+	}
+	p.crypt = cryptCodec
+	return packetBytes, nil
+}
 
 type tlsPacketIDState struct {
 	access    sync.Mutex
@@ -320,6 +431,17 @@ func (c *controlCryptCodec) decodeControlPacket(rawPacket []byte) ([]byte, bool)
 		return decodedPacket, true
 	}
 	return nil, false
+}
+
+// Upstream mudp.c reads the tls-crypt packet id of a V3 reset and treats the
+// EARLY_NEG_START marker in its most significant byte as the client announcing
+// that it can resend the wrapped client key.
+func tlsCryptV2ResetAnnouncesEarlyNegotiation(rawPacket []byte) bool {
+	if len(rawPacket) < tlsControlHeaderLength+4 {
+		return false
+	}
+	packetID := binary.BigEndian.Uint32(rawPacket[tlsControlHeaderLength : tlsControlHeaderLength+4])
+	return packetID&tlsCryptV2EarlyNegotiationStart == tlsCryptV2EarlyNegotiationStart
 }
 
 func tlsCryptV2ServerRequestsWrappedClientKeyResend(payload []byte) (bool, error) {

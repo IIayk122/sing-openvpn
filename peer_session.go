@@ -21,7 +21,7 @@ type tlsRoleCallbacks struct {
 	deriveKeyMaterial func(session *tlsPeerSession) ([]byte, error)
 	appendWrappedKey  func(session *tlsPeerSession, rawPacket []byte, opcode proto.Opcode) []byte
 	onTerminate       func(session *tlsPeerSession)
-	renegotiate       func(session *tlsPeerSession, channel *tlsControlChannel, initiator bool) (dataCodec, error)
+	renegotiate       func(session *tlsPeerSession, channel *tlsControlChannel, mustNegotiate time.Time) (dataCodec, error)
 	onRenegotiated    func(session *tlsPeerSession, keyID uint8)
 }
 
@@ -52,8 +52,14 @@ type tlsPeerSession struct {
 	dataCodec               dataCodec
 	protection              tlsControlProtection
 	dataTransportHeaderSize int
-	lifecycleAccess         sync.Mutex
-	closed                  bool
+	// Upstream key_state_init (ssl.c) stamps every key_state with
+	// must_negotiate = now + session->opt->handshake_window, and tls_process
+	// fails the key_state once now passes it before S_ACTIVE.
+	handshakeWindow time.Duration
+	lifecycleAccess sync.Mutex
+	closed          bool
+	messages        *dataChannelMessageSender
+	controlStream   tlsPrimaryControlStream
 
 	// Upstream tls_pre_decrypt keeps recent key_states addressable by key_id.
 	dataKeyAccess      sync.Mutex
@@ -94,14 +100,10 @@ type tlsPeerSession struct {
 }
 
 // Upstream BUF_SIZE (ssl.c) bounds plaintext control payloads.
-func readTLSControlRecord(connection *tls.Conn, timeout time.Duration) ([]byte, error) {
-	if timeout > 0 {
-		err := connection.SetReadDeadline(time.Now().Add(timeout))
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		_ = connection.SetReadDeadline(time.Time{})
+func readTLSControlRecord(connection *tls.Conn, deadline time.Time) ([]byte, error) {
+	err := connection.SetReadDeadline(deadline)
+	if err != nil {
+		return nil, err
 	}
 	buffer := make([]byte, 16384)
 	readCount, err := connection.Read(buffer)
@@ -111,29 +113,16 @@ func readTLSControlRecord(connection *tls.Conn, timeout time.Duration) ([]byte, 
 	return append([]byte{}, buffer[:readCount]...), nil
 }
 
-func (s *tlsPeerSession) handleIncomingHardReset(packet *proto.Packet) {
-	if packet == nil || packet.KeyID != 0 || !s.validRemoteHardResetOpcode(packet.Opcode) {
-		return
+func (s *tlsPeerSession) dataChannelMessages() *dataChannelMessageSender {
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	if s.closed {
+		return nil
 	}
-	remoteSessionID, hasRemoteSessionID := s.sessionManager.RemoteSessionID()
-	if hasRemoteSessionID && packet.LocalSessionID == remoteSessionID {
-		return
+	if s.messages == nil {
+		s.messages = startDataChannelMessageSender(s.WriteDataPacket)
 	}
-	// Upstream hard resets create a new tls_session and key_state.
-	restartErr := ErrPeerRestart
-	if s.role == tlsRoleClient {
-		restartErr = ErrServerRestart
-	}
-	go s.hooks.sessionTerminated(restartErr)
-}
-
-func (s *tlsPeerSession) validRemoteHardResetOpcode(opcode proto.Opcode) bool {
-	if s.role == tlsRoleClient {
-		return opcode == proto.OpcodeControlHardResetServerV1 || opcode == proto.OpcodeControlHardResetServerV2
-	}
-	return opcode == proto.OpcodeControlHardResetClientV1 ||
-		opcode == proto.OpcodeControlHardResetClientV2 ||
-		opcode == proto.OpcodeControlHardResetClientV3
+	return s.messages
 }
 
 func (s *tlsPeerSession) Close() error {
@@ -143,7 +132,11 @@ func (s *tlsPeerSession) Close() error {
 		packetConnection := s.packetConnection
 		tlsConnection := s.tlsConnection
 		controlChannel := s.controlChannel
+		messages := s.messages
 		s.lifecycleAccess.Unlock()
+		if messages != nil {
+			messages.shutdown()
+		}
 		if s.roleCallbacks.onTerminate != nil {
 			s.roleCallbacks.onTerminate(s)
 		}
@@ -181,6 +174,8 @@ func (s *tlsPeerSession) installInitialControlChannel(channel *tlsControlChannel
 	}
 	s.controlChannel = channel
 	s.tlsConnection = tlsConnection
+	channel.setTLSConnection(tlsConnection)
+	s.controlStream.install(channel, 0)
 	channel.loopWaitGroup.Add(2)
 	go channel.runReader()
 	go channel.runSender()
@@ -205,11 +200,7 @@ func (s *tlsPeerSession) writeHandshakePacket(packet *proto.Packet) error {
 	if err != nil {
 		return err
 	}
-	if s.protection.crypt != nil {
-		rawPacket = s.protection.crypt.encodeControlPacket(rawPacket)
-	} else if s.protection.auth != nil {
-		rawPacket = s.protection.auth.encodeControlPacket(rawPacket)
-	}
+	rawPacket = s.protection.encodeOutgoingControlPacket(rawPacket)
 	if s.roleCallbacks.appendWrappedKey != nil {
 		rawPacket = s.roleCallbacks.appendWrappedKey(s, rawPacket, packet.Opcode)
 	}

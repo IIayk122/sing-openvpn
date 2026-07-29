@@ -62,6 +62,15 @@ func writeTestPEM(t *testing.T, directory string, fileName string, blockType str
 	return filePath
 }
 
+func writeTestPEMBundle(t *testing.T, filePath string, blocks ...[]byte) string {
+	t.Helper()
+	err := os.WriteFile(filePath, bytes.Join(blocks, nil), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filePath
+}
+
 func writeTestPKCS8Key(t *testing.T, directory string, fileName string, privateKey *ecdsa.PrivateKey) string {
 	t.Helper()
 	pkcs8Bytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
@@ -221,39 +230,12 @@ func (c *rebindableUDPConn) Rebind(t *testing.T) {
 
 func reserveListenAddressForProtocol(t *testing.T, protocol string) string {
 	t.Helper()
+	port := strconv.Itoa(reserveInteropPort(t, protocol))
 	switch protocol {
-	case "tcp", "tcp4":
-		listener, err := net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		address := listener.Addr().String()
-		_ = listener.Close()
-		return address
-	case "tcp6":
-		listener, err := net.Listen("tcp6", "[::1]:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		address := listener.Addr().String()
-		_ = listener.Close()
-		return address
-	case "udp6":
-		listener, err := net.ListenPacket("udp6", "[::1]:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		address := listener.LocalAddr().String()
-		_ = listener.Close()
-		return address
+	case "tcp6", "udp6":
+		return net.JoinHostPort("::1", port)
 	default:
-		listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		address := listener.LocalAddr().String()
-		_ = listener.Close()
-		return address
+		return net.JoinHostPort("127.0.0.1", port)
 	}
 }
 

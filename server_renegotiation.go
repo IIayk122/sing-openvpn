@@ -142,11 +142,9 @@ func applyServerRenegotiationJitter(renegotiationDuration time.Duration) time.Du
 
 // Upstream tls_process reads the client key-method message before the
 // server reply during soft-reset renegotiation.
-func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiator bool) (dataCodec, error) {
-	_ = initiator
+func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, mustNegotiate time.Time) (dataCodec, error) {
 	tlsConnection := tls.Server(channel, s.server.tlsConfiguration)
-	deadline := time.Now().Add(s.server.parent.options.Timing.HandWindow)
-	deadlineErr := tlsConnection.SetDeadline(deadline)
+	deadlineErr := tlsConnection.SetDeadline(mustNegotiate)
 	if deadlineErr != nil {
 		return nil, deadlineErr
 	}
@@ -159,8 +157,11 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 	if certificateIdentityErr != nil {
 		return nil, certificateIdentityErr
 	}
-	clientKeyMethodRecord, err := readTLSControlRecord(tlsConnection, time.Until(deadline))
+	clientKeyMethodRecord, err := readTLSControlRecord(tlsConnection, mustNegotiate)
 	if err != nil {
+		if E.IsTimeout(err) {
+			return nil, ErrHandshakeTimeout
+		}
 		return nil, err
 	}
 	clientMessage, err := parseTLSKeyMethod2Payload(clientKeyMethodRecord, false)
@@ -220,7 +221,7 @@ func (s *tlsServerSession) runRenegotiation(channel *tlsControlChannel, initiato
 	if writeErr != nil {
 		return newCodec, writeErr
 	}
-	if !channel.waitForReliableDelivery(time.Until(deadline)) {
+	if !channel.waitForReliableDelivery(time.Until(mustNegotiate)) {
 		return newCodec, ErrHandshakeTimeout
 	}
 	_ = tlsConnection.SetDeadline(time.Time{})

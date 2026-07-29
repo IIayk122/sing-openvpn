@@ -14,6 +14,7 @@ import (
 )
 
 func TestTLSUDPPeerIDNATRebindingAndHijackResistance(t *testing.T) {
+	t.Parallel()
 	serverTransport := newObservedPacketConn(t)
 	serverContext, cancelServer := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelServer()

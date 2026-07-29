@@ -67,7 +67,7 @@ func generateTLSKeyMethodKeySource(isClient bool) (tlsKeyMethodKeySource, error)
 	return keySource, nil
 }
 
-func buildTLSOptionsStringWithMTU(protocol string, isClient bool, tlsAuthEnabled bool, compression string, compressionLZO string, cipherName string, authName string, tunMTU uint32) string {
+func buildTLSOptionsStringWithMTU(protocol string, isClient bool, tlsAuthEnabled bool, compression compressionSettings, cipherName string, authName string, tunMTU uint32) string {
 	if tunMTU == 0 {
 		tunMTU = 1500
 	}
@@ -80,7 +80,9 @@ func buildTLSOptionsStringWithMTU(protocol string, isClient bool, tlsAuthEnabled
 	builder.WriteString(",proto ")
 	builder.WriteString(tlsProtoName(protocol, isClient))
 
-	if isLZOCompressionEnabled(compression, compressionLZO) {
+	// Upstream options_string (options.c) writes comp-lzo for every active
+	// compression context, not only for the LZO algorithm.
+	if compression.framingEnabled() {
 		builder.WriteString(",comp-lzo")
 	}
 
@@ -158,11 +160,8 @@ func buildTLSPeerInfo(options ClientOptions, requestPush bool) string {
 	}
 	builder.WriteString("IV_LZ4=1\n")
 	builder.WriteString("IV_LZ4v2=1\n")
-	allowCompression, _ := resolveEffectiveAllowCompressionPolicy(
-		options.DataChannel.AllowCompression,
-		options.DataChannel.Compression,
-		options.DataChannel.CompressionLZO,
-	)
+	compression, _ := resolveCompressionSettings(options.DataChannel.Compression, options.DataChannel.CompressionLZO)
+	allowCompression, _ := resolveEffectiveAllowCompressionPolicy(options.DataChannel.AllowCompression, compression)
 	if allowCompression != allowCompressionStubOnly {
 		builder.WriteString("IV_LZO=1\n")
 	} else {

@@ -13,6 +13,7 @@ import (
 )
 
 func TestTLSServerRejectsUnownedTunnelSources(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelServerContext()

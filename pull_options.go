@@ -1,6 +1,7 @@
 package openvpn
 
 import (
+	"math"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -67,8 +68,7 @@ type wirePushedOptions struct {
 	KeyDerivation         string
 	ExplicitExitNotify    uint32
 	ExplicitExitNotifySet bool
-	Compression           string
-	CompressionLZO        string
+	CompressionDirectives []compressionDirective
 	InactiveTimeout       time.Duration
 	InactiveMinimumBytes  uint64
 	InactiveTimeoutSet    bool
@@ -89,55 +89,56 @@ const (
 
 const peerIDMaxValue = (1 << 24) - 1
 
-func appendPushReplyPayloadSegment(accumulatedFields []string, payload []byte) ([]string, int, bool) {
+// Upstream process_incoming_push_msg (push.c) hands the payload that follows
+// "PUSH_REPLY," to apply_push_options (options.c), which cuts it into option
+// lines with buf_parse(buf, ','): the comma is a raw separator and carries no
+// escape of any kind.
+func splitPushReplyPayloadLines(payload []byte) (string, []string, bool) {
 	payloadValue := normalizeControlPayload(payload)
 	if payloadValue == "" {
-		return accumulatedFields, 0, false
+		return "", nil, false
 	}
-	payloadFields := splitEscapedCommaFields(payloadValue)
-	if len(payloadFields) == 0 {
-		return accumulatedFields, 0, false
-	}
-	commandName := strings.TrimSpace(payloadFields[0])
+	payloadLines := strings.Split(payloadValue, ",")
+	commandName := strings.TrimSpace(payloadLines[0])
 	if !strings.EqualFold(commandName, pushReplyPayloadPrefix) &&
 		!strings.EqualFold(commandName, pushUpdatePayloadPrefix) {
-		return accumulatedFields, 0, false
+		return "", nil, false
 	}
-	if len(accumulatedFields) == 0 {
-		accumulatedFields = append(accumulatedFields, commandName)
+	return commandName, payloadLines[1:], true
+}
+
+func appendPushReplyPayloadSegment(accumulatedLines []string, payload []byte) ([]string, int, bool) {
+	commandName, payloadLines, decoded := splitPushReplyPayloadLines(payload)
+	if !decoded {
+		return accumulatedLines, 0, false
+	}
+	if len(accumulatedLines) == 0 {
+		accumulatedLines = append(accumulatedLines, commandName)
 	}
 	continuation := 0
-	for _, payloadField := range payloadFields[1:] {
-		optionName, optionValue, hasOption := parsePushReplyField(payloadField)
-		if !hasOption {
-			continue
-		}
-		if strings.EqualFold(optionName, "push-continuation") {
-			continuationValue, err := strconv.Atoi(optionValue)
+	for _, optionLine := range payloadLines {
+		parameters, parsed := parsePushedOptionLine(optionLine)
+		if parsed && len(parameters) >= 2 && strings.EqualFold(parameters[0], "push-continuation") {
+			continuationValue, err := strconv.Atoi(parameters[1])
 			if err == nil && continuationValue >= 0 && continuationValue <= 2 {
 				continuation = continuationValue
 			}
-			continue
 		}
-		accumulatedFields = append(accumulatedFields, payloadField)
+		accumulatedLines = append(accumulatedLines, optionLine)
 	}
-	return accumulatedFields, continuation, true
+	return accumulatedLines, continuation, true
 }
 
 func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, filters []PullFilter) (pushedOptions, int, bool) {
-	payloadValue := normalizeControlPayload(payload)
-	if payloadValue == "" {
+	commandName, payloadLines, decoded := splitPushReplyPayloadLines(payload)
+	if !decoded {
 		return pushedOptions{}, 0, false
 	}
-	payloadFields := splitEscapedCommaFields(payloadValue)
-	if len(payloadFields) == 0 {
-		return pushedOptions{}, 0, false
-	}
-	commandName := strings.TrimSpace(payloadFields[0])
-	if !strings.EqualFold(commandName, pushReplyPayloadPrefix) &&
-		!strings.EqualFold(commandName, pushUpdatePayloadPrefix) {
-		return pushedOptions{}, 0, false
-	}
+	options, continuation := decodePushReplyOptionLines(commandName, payloadLines, remoteHost, filters)
+	return options, continuation, true
+}
+
+func decodePushReplyOptionLines(commandName string, optionLines []string, remoteHost netip.Addr, filters []PullFilter) (pushedOptions, int) {
 	kind := pushOptionsKindReply
 	if strings.EqualFold(commandName, pushUpdatePayloadPrefix) {
 		kind = pushOptionsKindUpdate
@@ -145,8 +146,8 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 	var wireOptions wirePushedOptions
 	var continuation int
 	var pullFilterRejection string
-	for _, payloadField := range payloadFields[1:] {
-		optionLine := strings.TrimLeft(payloadField, " \t\r\n\v\f")
+	for _, payloadLine := range optionLines {
+		optionLine := strings.TrimLeft(payloadLine, " \t\r\n\v\f")
 		allowed, rejected := applyPullFilters(filters, optionLine)
 		if rejected {
 			pullFilterRejection = optionLine
@@ -155,18 +156,20 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 		if !allowed {
 			continue
 		}
-		optionName, optionValue, hasOption := parsePushReplyField(payloadField)
-		if !hasOption {
+		parameters, parsed := parsePushedOptionLine(payloadLine)
+		if !parsed {
 			continue
 		}
+		optionName := parameters[0]
+		optionValue := strings.Join(parameters[1:], " ")
 		switch strings.ToLower(optionName) {
 		case "topology":
 			if optionValue != "" {
 				wireOptions.Topology = optionValue
 			}
 		case "tun-mtu":
-			tunMTUValue, err := strconv.Atoi(optionValue)
-			if err == nil && tunMTUValue > 0 {
+			tunMTUValue := parsePushedPositiveInteger(optionValue)
+			if tunMTUValue > 0 {
 				wireOptions.TunMTU = uint32(tunMTUValue)
 			}
 		case "ifconfig":
@@ -212,21 +215,18 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 				wireOptions.RedirectGatewayFlags = strings.Fields(optionValue)
 			}
 		case "route-metric":
-			routeMetricValue, err := strconv.Atoi(optionValue)
-			if err == nil && routeMetricValue >= 0 {
-				wireOptions.RouteMetric = routeMetricValue
+			if optionValue != "" {
+				wireOptions.RouteMetric = int(parsePushedPositiveInteger(optionValue))
 				wireOptions.RouteMetricSet = true
 			}
 		case "ping":
-			pingValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && pingValue >= 0 {
-				wireOptions.PingInterval = time.Duration(pingValue) * time.Second
+			if optionValue != "" {
+				wireOptions.PingInterval = parsePushedSecondCount(optionValue)
 				wireOptions.PingIntervalEnabled = true
 			}
 		case "ping-restart":
-			pingRestartValue, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && pingRestartValue >= 0 {
-				wireOptions.PingRestart = time.Duration(pingRestartValue) * time.Second
+			if optionValue != "" {
+				wireOptions.PingRestart = parsePushedSecondCount(optionValue)
 				wireOptions.PingRestartEnabled = true
 				wireOptions.PingTimeoutAction = pushedPingTimeoutRestart
 			}
@@ -257,38 +257,22 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 				wireOptions.KeyDerivation = strings.ToLower(strings.TrimSpace(optionValue))
 			}
 		case "explicit-exit-notify":
-			notifyValue, err := strconv.ParseUint(strings.TrimSpace(optionValue), 10, 32)
-			if err == nil {
-				wireOptions.ExplicitExitNotify = uint32(notifyValue)
-				wireOptions.ExplicitExitNotifySet = true
-			} else if optionValue == "" {
+			if optionValue == "" {
 				wireOptions.ExplicitExitNotify = 1
-				wireOptions.ExplicitExitNotifySet = true
+			} else {
+				wireOptions.ExplicitExitNotify = uint32(parsePushedPositiveInteger(optionValue))
 			}
-		case "compress":
-			compressValue := strings.TrimSpace(optionValue)
-			if compressValue == "" {
-				// Upstream options_postprocess_mutate (options.c) maps bare
-				// compress to stub.
-				compressValue = "stub"
-			}
-			wireOptions.Compression = compressValue
-		case "comp-lzo":
-			compLZOValue := strings.TrimSpace(optionValue)
-			if compLZOValue == "" {
-				// Upstream options_postprocess_mutate (options.c) maps bare
-				// comp-lzo to adaptive.
-				compLZOValue = "adaptive"
-			}
-			wireOptions.CompressionLZO = compLZOValue
+			wireOptions.ExplicitExitNotifySet = true
+		case compressionDirectiveCompress, compressionDirectiveLZO:
+			wireOptions.CompressionDirectives = append(wireOptions.CompressionDirectives, compressionDirective{
+				Name:  strings.ToLower(optionName),
+				Value: strings.TrimSpace(optionValue),
+			})
 		case "inactive":
 			inactiveFields := strings.Fields(optionValue)
 			if len(inactiveFields) >= 1 {
-				inactiveSeconds, err := strconv.Atoi(inactiveFields[0])
-				if err == nil && inactiveSeconds >= 0 {
-					wireOptions.InactiveTimeout = time.Duration(inactiveSeconds) * time.Second
-					wireOptions.InactiveTimeoutSet = true
-				}
+				wireOptions.InactiveTimeout = parsePushedSecondCount(inactiveFields[0])
+				wireOptions.InactiveTimeoutSet = true
 				if len(inactiveFields) >= 2 {
 					// Upstream parse_inactive (options.c) clamps negative
 					// minimum-bytes to 0.
@@ -299,15 +283,13 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 				}
 			}
 		case "session-timeout":
-			sessionSeconds, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && sessionSeconds >= 0 {
-				wireOptions.SessionTimeout = time.Duration(sessionSeconds) * time.Second
+			if optionValue != "" {
+				wireOptions.SessionTimeout = parsePushedSecondCount(optionValue)
 				wireOptions.SessionTimeoutSet = true
 			}
 		case "ping-exit":
-			pingExitSeconds, err := strconv.Atoi(strings.TrimSpace(optionValue))
-			if err == nil && pingExitSeconds >= 0 {
-				wireOptions.PingExit = time.Duration(pingExitSeconds) * time.Second
+			if optionValue != "" {
+				wireOptions.PingExit = parsePushedSecondCount(optionValue)
 				wireOptions.PingExitSet = true
 				wireOptions.PingTimeoutAction = pushedPingTimeoutExit
 			}
@@ -323,7 +305,43 @@ func decodePushReplyPayloadWithFilters(payload []byte, remoteHost netip.Addr, fi
 	options := pushedOptionsFromWire(wireOptions, remoteHost)
 	options.kind = kind
 	options.pullFilterRejection = pullFilterRejection
-	return options, continuation, true
+	return options, continuation
+}
+
+// Upstream reads these pushed values with positive_atoi (options.c): atoi()
+// with a negative result replaced by zero. atoi() is (int)strtol(), so it skips
+// leading whitespace, stops at the first character the number does not cover,
+// saturates at LONG_MIN/LONG_MAX and keeps only the low 32 bits of what strtol
+// returned.
+func parsePushedPositiveInteger(value string) int32 {
+	text := strings.TrimLeft(value, " \t\n\v\f\r")
+	numberEnd := 0
+	if numberEnd < len(text) && (text[numberEnd] == '+' || text[numberEnd] == '-') {
+		numberEnd++
+	}
+	digitStart := numberEnd
+	for numberEnd < len(text) && text[numberEnd] >= '0' && text[numberEnd] <= '9' {
+		numberEnd++
+	}
+	if numberEnd == digitStart {
+		return 0
+	}
+	parsed, err := strconv.ParseInt(text[:numberEnd], 10, 64)
+	if err != nil {
+		parsed = math.MaxInt64
+		if text[0] == '-' {
+			parsed = math.MinInt64
+		}
+	}
+	truncated := int32(parsed)
+	if truncated < 0 {
+		return 0
+	}
+	return truncated
+}
+
+func parsePushedSecondCount(value string) time.Duration {
+	return time.Duration(parsePushedPositiveInteger(value)) * time.Second
 }
 
 func applyPullFilters(filters []PullFilter, optionLine string) (bool, bool) {
@@ -368,8 +386,7 @@ func pushedOptionsFromWire(wireOptions wirePushedOptions, remoteHost netip.Addr)
 		KeyDerivation:         wireOptions.KeyDerivation,
 		ExplicitExitNotify:    wireOptions.ExplicitExitNotify,
 		ExplicitExitNotifySet: wireOptions.ExplicitExitNotifySet,
-		Compression:           wireOptions.Compression,
-		CompressionLZO:        wireOptions.CompressionLZO,
+		CompressionDirectives: slices.Clone(wireOptions.CompressionDirectives),
 		InactiveTimeout:       wireOptions.InactiveTimeout,
 		InactiveMinimumBytes:  wireOptions.InactiveMinimumBytes,
 		InactiveTimeoutSet:    wireOptions.InactiveTimeoutSet,
@@ -444,14 +461,14 @@ func (options *pushedOptions) addWireIfconfigIPv6(value string) {
 	if raw == "" {
 		return
 	}
-	prefix, err := parseIfconfigIPv6Prefix(raw)
+	prefix, peer, err := parseIfconfigIPv6(raw)
 	if err != nil {
 		options.addParseError("ifconfig-ipv6", raw, err)
 		return
 	}
 	options.LocalAddress = append(options.LocalAddress, pushedLocalAddress{
 		Prefix: prefix,
-		Peer:   parseIfconfigIPv6Peer(raw),
+		Peer:   peer,
 		Raw:    raw,
 	})
 }
@@ -761,64 +778,112 @@ func (options *pushedOptions) addExcludedRoute(name string, value string, route 
 	})
 }
 
-func parseIfconfigIPv6Peer(value string) netip.Addr {
-	fields := strings.Fields(value)
-	if len(fields) < 2 {
-		return netip.Addr{}
-	}
-	peer, err := netip.ParseAddr(fields[1])
-	if err != nil || !peer.Is6() {
-		return netip.Addr{}
-	}
-	return peer
-}
-
 func normalizeControlPayload(payload []byte) string {
 	trimmedPayload := strings.Trim(string(payload), "\x00")
 	return strings.TrimSpace(trimmedPayload)
 }
 
-func splitEscapedCommaFields(value string) []string {
-	if value == "" {
-		return nil
+const (
+	pushedOptionLineStateInitial = iota
+	pushedOptionLineStateQuoted
+	pushedOptionLineStateUnquoted
+	pushedOptionLineStateDone
+	pushedOptionLineStateSingleQuoted
+)
+
+// MAX_PARMS (options.h); apply_push_options calls parse_line with
+// SIZE(p) - 1 parameter slots.
+const pushedOptionLineMaxParameters = 16
+
+// Upstream space() (options.c) counts the terminating NUL as whitespace, which
+// is what closes the last unquoted parameter of a line.
+func isPushedOptionLineSpace(character byte) bool {
+	switch character {
+	case 0, ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	default:
+		return false
 	}
-	fields := make([]string, 0, 8)
-	var fieldBuilder strings.Builder
-	escaped := false
-	for _, character := range value {
-		if escaped {
-			fieldBuilder.WriteRune(character)
-			escaped = false
-			continue
-		}
-		if character == '\\' {
-			escaped = true
-			continue
-		}
-		if character == ',' {
-			fields = append(fields, fieldBuilder.String())
-			fieldBuilder.Reset()
-			continue
-		}
-		fieldBuilder.WriteRune(character)
-	}
-	if escaped {
-		fieldBuilder.WriteByte('\\')
-	}
-	fields = append(fields, fieldBuilder.String())
-	return fields
 }
 
-func parsePushReplyField(value string) (string, string, bool) {
-	fieldValue := strings.TrimSpace(value)
-	if fieldValue == "" {
-		return "", "", false
+// parse_line (options.c) splits one option line into parameters, and it is the
+// only place upstream processes an escape: a backslash quotes the next
+// character, but only '\\', '"' and whitespace may follow it — anything else
+// makes parse_line report "Bad backslash ('\') usage" and return zero
+// parameters, which drops the whole option line. A line that ends inside a
+// parameter (trailing backslash, unbalanced quote) is dropped the same way with
+// "Residual parse state". Single quotes suppress backslash processing entirely,
+// and ';' or '#' at the start of a parameter comments out the rest of the line.
+func parsePushedOptionLine(line string) ([]string, bool) {
+	parameters := make([]string, 0, 4)
+	var parameter strings.Builder
+	state := pushedOptionLineStateInitial
+	backslash := false
+parameterLoop:
+	for index := 0; index <= len(line); index++ {
+		var character byte
+		if index < len(line) {
+			character = line[index]
+		}
+		if !backslash && character == '\\' && state != pushedOptionLineStateSingleQuoted {
+			backslash = true
+			continue
+		}
+		if backslash && character != '\\' && character != '"' && !isPushedOptionLineSpace(character) {
+			return nil, false
+		}
+		var stored byte
+		switch state {
+		case pushedOptionLineStateInitial:
+			if isPushedOptionLineSpace(character) {
+				break
+			}
+			if character == ';' || character == '#' {
+				break parameterLoop
+			}
+			switch {
+			case !backslash && character == '"':
+				state = pushedOptionLineStateQuoted
+			case !backslash && character == '\'':
+				state = pushedOptionLineStateSingleQuoted
+			default:
+				stored = character
+				state = pushedOptionLineStateUnquoted
+			}
+		case pushedOptionLineStateUnquoted:
+			if !backslash && isPushedOptionLineSpace(character) {
+				state = pushedOptionLineStateDone
+			} else {
+				stored = character
+			}
+		case pushedOptionLineStateQuoted:
+			if !backslash && character == '"' {
+				state = pushedOptionLineStateDone
+			} else {
+				stored = character
+			}
+		case pushedOptionLineStateSingleQuoted:
+			if character == '\'' {
+				state = pushedOptionLineStateDone
+			} else {
+				stored = character
+			}
+		}
+		if state == pushedOptionLineStateDone {
+			parameters = append(parameters, parameter.String())
+			parameter.Reset()
+			state = pushedOptionLineStateInitial
+			if len(parameters) >= pushedOptionLineMaxParameters {
+				break parameterLoop
+			}
+		}
+		backslash = false
+		if stored != 0 {
+			parameter.WriteByte(stored)
+		}
 	}
-	separatorIndex := strings.IndexAny(fieldValue, " \t")
-	if separatorIndex < 0 {
-		return fieldValue, "", true
+	if state != pushedOptionLineStateInitial || len(parameters) == 0 {
+		return nil, false
 	}
-	optionName := fieldValue[:separatorIndex]
-	optionValue := strings.TrimSpace(fieldValue[separatorIndex+1:])
-	return optionName, optionValue, true
+	return parameters, true
 }

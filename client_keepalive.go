@@ -6,9 +6,8 @@ import (
 )
 
 type tlsClientKeepalive struct {
-	session         *tlsClient
-	parent          *Client
-	writeDataPacket func(payload []byte) error
+	session *tlsClient
+	parent  *Client
 
 	access sync.Mutex
 
@@ -234,9 +233,9 @@ func (k *tlsClientKeepalive) runLoop() {
 			return
 		}
 		if pingInterval > 0 && (lastOutbound.IsZero() || now.Sub(lastOutbound) >= pingInterval) {
-			writeErr := k.writeDataPacket(openVPNDataChannelPingPayload)
-			if writeErr == nil {
-				k.markActivity(false, true)
+			messages := k.session.dataChannelMessages()
+			if messages != nil {
+				messages.sendPing()
 			}
 		}
 	}

@@ -25,7 +25,6 @@ func buildPushedOptions(options ServerOptions) pushedOptions {
 		localAddress = applyPushedIPv6LocalAddressPeer(localAddress, prefix.Addr())
 	}
 	return pushedOptions{
-		Topology:             options.Tunnel.Topology,
 		TunMTU:               options.DataChannel.MTU,
 		LocalAddress:         localAddress,
 		Routes:               pushedRoutesFromPrefixes(options.Push.Routes),
@@ -47,7 +46,7 @@ func buildPushedOptions(options ServerOptions) pushedOptions {
 func buildPushReplyOptionFields(options pushedOptions) []string {
 	pushOptionFields := []string{pushReplyPayloadPrefix}
 	if topology := strings.TrimSpace(options.Topology); topology != "" {
-		pushOptionFields = append(pushOptionFields, "topology "+escapePushReplyFieldValue(topology))
+		pushOptionFields = append(pushOptionFields, "topology "+topology)
 	}
 	if options.TunMTU > 0 {
 		pushOptionFields = append(pushOptionFields, "tun-mtu "+strconv.FormatUint(uint64(options.TunMTU), 10))
@@ -56,17 +55,17 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 		if localAddress.Prefix.Addr().Is4() {
 			ifconfigValue := strings.TrimSpace(formatPushedIfconfig(localAddress, options.Topology))
 			if ifconfigValue != "" {
-				pushOptionFields = append(pushOptionFields, "ifconfig "+escapePushReplyFieldValue(ifconfigValue))
+				pushOptionFields = append(pushOptionFields, "ifconfig "+ifconfigValue)
 			}
 		} else if localAddress.Prefix.Addr().Is6() {
 			ifconfigIPv6Value := strings.TrimSpace(formatPushedIfconfigIPv6(localAddress))
 			if ifconfigIPv6Value != "" {
-				pushOptionFields = append(pushOptionFields, "ifconfig-ipv6 "+escapePushReplyFieldValue(ifconfigIPv6Value))
+				pushOptionFields = append(pushOptionFields, "ifconfig-ipv6 "+ifconfigIPv6Value)
 			}
 		}
 	}
 	if routeGateway := formatPushedRouteGateway(options); routeGateway != "" {
-		pushOptionFields = append(pushOptionFields, "route-gateway "+escapePushReplyFieldValue(routeGateway))
+		pushOptionFields = append(pushOptionFields, "route-gateway "+routeGateway)
 	}
 	for _, route := range options.Routes {
 		routeValue := strings.TrimSpace(formatPushedRoute(route))
@@ -74,9 +73,9 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 			continue
 		}
 		if route.Route.Prefix.Addr().Is4() {
-			pushOptionFields = append(pushOptionFields, "route "+escapePushReplyFieldValue(routeValue))
+			pushOptionFields = append(pushOptionFields, "route "+routeValue)
 		} else if route.Route.Prefix.Addr().Is6() {
-			pushOptionFields = append(pushOptionFields, "route-ipv6 "+escapePushReplyFieldValue(routeValue))
+			pushOptionFields = append(pushOptionFields, "route-ipv6 "+routeValue)
 		}
 	}
 	for _, dnsValue := range options.DNS {
@@ -84,13 +83,13 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 			continue
 		}
 		if dnsValue.Address.Is4() {
-			pushOptionFields = append(pushOptionFields, "dhcp-option DNS "+escapePushReplyFieldValue(dnsValue.Address.String()))
+			pushOptionFields = append(pushOptionFields, "dhcp-option DNS "+dnsValue.Address.String())
 		} else if dnsValue.Address.Is6() {
-			pushOptionFields = append(pushOptionFields, "dhcp-option DNS6 "+escapePushReplyFieldValue(dnsValue.Address.String()))
+			pushOptionFields = append(pushOptionFields, "dhcp-option DNS6 "+dnsValue.Address.String())
 		}
 	}
 	if len(options.SearchDomains) > 0 {
-		pushOptionFields = append(pushOptionFields, "dns search-domains "+escapePushReplyFieldValue(strings.Join(options.SearchDomains, " ")))
+		pushOptionFields = append(pushOptionFields, "dns search-domains "+strings.Join(options.SearchDomains, " "))
 	}
 	servers := cloneTunnelDNSServers(options.DNSServers)
 	slices.SortFunc(servers, func(left TunnelDNSServer, right TunnelDNSServer) int {
@@ -107,13 +106,13 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 					addresses[i] = address.String()
 				}
 			}
-			pushOptionFields = append(pushOptionFields, "dns server "+priority+" address "+escapePushReplyFieldValue(strings.Join(addresses, " ")))
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" address "+strings.Join(addresses, " "))
 		}
 		if len(server.ResolveDomains) > 0 {
-			pushOptionFields = append(pushOptionFields, "dns server "+priority+" resolve-domains "+escapePushReplyFieldValue(strings.Join(server.ResolveDomains, " ")))
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" resolve-domains "+strings.Join(server.ResolveDomains, " "))
 		}
 		if server.DNSSEC != "" {
-			pushOptionFields = append(pushOptionFields, "dns server "+priority+" dnssec "+escapePushReplyFieldValue(server.DNSSEC))
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" dnssec "+server.DNSSEC)
 		}
 		if server.Transport != "" {
 			transport := server.Transport
@@ -123,10 +122,10 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 			case "dot":
 				transport = "DoT"
 			}
-			pushOptionFields = append(pushOptionFields, "dns server "+priority+" transport "+escapePushReplyFieldValue(transport))
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" transport "+transport)
 		}
 		if server.SNI != "" {
-			pushOptionFields = append(pushOptionFields, "dns server "+priority+" sni "+escapePushReplyFieldValue(server.SNI))
+			pushOptionFields = append(pushOptionFields, "dns server "+priority+" sni "+server.SNI)
 		}
 	}
 	for _, dhcpOption := range options.DHCPOptions {
@@ -134,7 +133,7 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 		if dhcpOption == "" {
 			continue
 		}
-		pushOptionFields = append(pushOptionFields, "dhcp-option "+escapePushReplyFieldValue(dhcpOption))
+		pushOptionFields = append(pushOptionFields, "dhcp-option "+dhcpOption)
 	}
 	if options.BlockIPv6 {
 		pushOptionFields = append(pushOptionFields, "block-ipv6")
@@ -147,7 +146,7 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 		if redirectGatewayValue == "" {
 			pushOptionFields = append(pushOptionFields, "redirect-gateway")
 		} else {
-			pushOptionFields = append(pushOptionFields, "redirect-gateway "+escapePushReplyFieldValue(redirectGatewayValue))
+			pushOptionFields = append(pushOptionFields, "redirect-gateway "+redirectGatewayValue)
 		}
 	}
 	if options.RedirectPrivate {
@@ -163,34 +162,36 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 		pushOptionFields = append(pushOptionFields, "ping-restart "+strconv.FormatInt(int64(options.PingRestart/time.Second), 10))
 	}
 	if authToken := strings.TrimSpace(options.AuthToken); authToken != "" {
-		pushOptionFields = append(pushOptionFields, "auth-token "+escapePushReplyFieldValue(authToken))
+		pushOptionFields = append(pushOptionFields, "auth-token "+authToken)
 	}
 	if authTokenUser := strings.TrimSpace(options.AuthTokenUser); authTokenUser != "" {
-		pushOptionFields = append(pushOptionFields, "auth-token-user "+escapePushReplyFieldValue(authTokenUser))
+		pushOptionFields = append(pushOptionFields, "auth-token-user "+authTokenUser)
 	}
 	if options.PeerID != nil {
 		pushOptionFields = append(pushOptionFields, "peer-id "+strconv.FormatUint(uint64(*options.PeerID), 10))
 	}
 	if selectedCipher := strings.TrimSpace(options.SelectedCipher); selectedCipher != "" {
-		pushOptionFields = append(pushOptionFields, "cipher "+escapePushReplyFieldValue(selectedCipher))
+		pushOptionFields = append(pushOptionFields, "cipher "+selectedCipher)
 	}
 	if selectedAuth := strings.TrimSpace(options.SelectedAuth); selectedAuth != "" {
-		pushOptionFields = append(pushOptionFields, "auth "+escapePushReplyFieldValue(selectedAuth))
+		pushOptionFields = append(pushOptionFields, "auth "+selectedAuth)
 	}
 	if len(options.ProtocolFlags) > 0 {
-		pushOptionFields = append(pushOptionFields, "protocol-flags "+escapePushReplyFieldValue(strings.Join(options.ProtocolFlags, " ")))
+		pushOptionFields = append(pushOptionFields, "protocol-flags "+strings.Join(options.ProtocolFlags, " "))
 	}
 	if keyDerivation := strings.TrimSpace(options.KeyDerivation); keyDerivation != "" {
-		pushOptionFields = append(pushOptionFields, "key-derivation "+escapePushReplyFieldValue(keyDerivation))
+		pushOptionFields = append(pushOptionFields, "key-derivation "+keyDerivation)
 	}
 	if options.ExplicitExitNotify > 0 {
 		pushOptionFields = append(pushOptionFields, "explicit-exit-notify "+strconv.FormatUint(uint64(options.ExplicitExitNotify), 10))
 	}
-	if compressValue := strings.TrimSpace(options.Compression); compressValue != "" {
-		pushOptionFields = append(pushOptionFields, "compress "+escapePushReplyFieldValue(compressValue))
-	}
-	if compLZOValue := strings.TrimSpace(options.CompressionLZO); compLZOValue != "" {
-		pushOptionFields = append(pushOptionFields, "comp-lzo "+escapePushReplyFieldValue(compLZOValue))
+	for _, directive := range options.CompressionDirectives {
+		directiveValue := strings.TrimSpace(directive.Value)
+		if directiveValue == "" {
+			pushOptionFields = append(pushOptionFields, directive.Name)
+			continue
+		}
+		pushOptionFields = append(pushOptionFields, directive.Name+" "+directiveValue)
 	}
 	if options.InactiveTimeout > 0 {
 		inactiveField := "inactive " + strconv.FormatInt(int64(options.InactiveTimeout/time.Second), 10)
@@ -209,12 +210,6 @@ func buildPushReplyOptionFields(options pushedOptions) []string {
 		pushOptionFields = append(pushOptionFields, "ping-timer-rem")
 	}
 	return pushOptionFields
-}
-
-func escapePushReplyFieldValue(value string) string {
-	escapedValue := strings.ReplaceAll(value, `\`, `\\`)
-	escapedValue = strings.ReplaceAll(escapedValue, ",", `\,`)
-	return escapedValue
 }
 
 func applyPushedIPv6LocalAddressPeer(values []pushedLocalAddress, peer netip.Addr) []pushedLocalAddress {

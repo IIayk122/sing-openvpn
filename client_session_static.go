@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-openvpn/proto"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -30,6 +31,7 @@ type staticKeyClientSession struct {
 	writeAccess      sync.Mutex
 	ready            bool
 	closed           bool
+	messages         *dataChannelMessageSender
 	lastInboundTime  time.Time
 	lastOutboundTime time.Time
 }
@@ -157,13 +159,22 @@ func (s *staticKeyClientSession) WriteDataPackets(packets [][]byte) error {
 	if !s.Ready() || s.packetConnection == nil {
 		return ErrDataChannelNotReady
 	}
+	packets = common.Filter(packets, func(packet []byte) bool {
+		return len(packet) > 0
+	})
+	if len(packets) == 0 {
+		return nil
+	}
 	s.writeAccess.Lock()
 	defer s.writeAccess.Unlock()
 	transportHeaderSize := dataTransportHeaderSize(s.remote.remote.Protocol)
-	preparedPayloads, preparationErr := s.parent.outgoingDataPayloadBatches(packets, s.dataCodec, transportHeaderSize, openVPNOuterTransportOverhead(s.remote.remote.Protocol, s.packetConnection.RemoteAddr()))
+	preparedPayloads := s.parent.outgoingDataPayloadBatches(packets, s.dataCodec, transportHeaderSize, openVPNOuterTransportOverhead(s.remote.remote.Protocol, s.packetConnection.RemoteAddr()))
 	preparedPacketCount := 0
 	for _, outgoingPayloads := range preparedPayloads {
 		preparedPacketCount += len(outgoingPayloads)
+	}
+	if preparedPacketCount == 0 {
+		return nil
 	}
 	dataPacketIDs, err := s.sessionManager.NewDataPacketIDs(proto.OpcodeDataV1, preparedPacketCount)
 	if err != nil {
@@ -186,9 +197,6 @@ func (s *staticKeyClientSession) WriteDataPackets(packets [][]byte) error {
 		if encodeErr != nil {
 			break
 		}
-	}
-	if encodeErr == nil {
-		encodeErr = preparationErr
 	}
 	writtenPackets, writeErr := s.packetConnection.WritePackets(rawPackets)
 	if writeErr != nil {
@@ -224,7 +232,11 @@ func (s *staticKeyClientSession) Close() error {
 		s.ready = false
 		cancelSession := s.cancelSession
 		packetConnection := s.packetConnection
+		messages := s.messages
 		s.access.Unlock()
+		if messages != nil {
+			messages.shutdown()
+		}
 		if cancelSession != nil {
 			cancelSession()
 		}
@@ -251,10 +263,19 @@ func (s *staticKeyClientSession) readLoop() {
 		rawPacketBuffers, readErr := s.packetConnection.ReadPackets()
 		decodedPayloads := make([][]byte, 0, len(rawPacketBuffers))
 		authenticatedPacketReceived := false
+		var fatalDecodeError error
 		for _, rawPacketBuffer := range rawPacketBuffers {
 			_, decodedPayload, decodeError := s.dataCodec.Decode(nil, rawPacketBuffer.Bytes())
 			if decodeError != nil {
 				s.parent.dataPlane.incomingPacketDropLog.Log(decodeError)
+				// Upstream process_incoming_link_part1 (forward.c) registers
+				// SIGUSR1 for an openvpn_decrypt failure while
+				// link_socket_connection_oriented holds, which restarts the
+				// --secret connection instead of reading the stream on.
+				if s.packetConnection.ConnectionOriented() {
+					fatalDecodeError = E.Extend(ErrFatalDecryption, decodeError.Error())
+					break
+				}
 				continue
 			}
 			authenticatedPacketReceived = true
@@ -264,6 +285,9 @@ func (s *staticKeyClientSession) readLoop() {
 				continue
 			}
 			if !framingComplete {
+				continue
+			}
+			if len(framedPayload) == 0 {
 				continue
 			}
 			if bytes.Equal(framedPayload, openVPNDataChannelPingPayload) {
@@ -278,6 +302,10 @@ func (s *staticKeyClientSession) readLoop() {
 			s.access.Unlock()
 		}
 		s.parent.handleIncomingDataPayloads(decodedPayloads, s.dataCodec, dataTransportHeaderSize(s.remote.remote.Protocol), openVPNOuterTransportOverhead(s.remote.remote.Protocol, s.packetConnection.RemoteAddr()))
+		if fatalDecodeError != nil {
+			s.finish(fatalDecodeError)
+			return
+		}
 		keepaliveErr := s.checkKeepalive(time.Now())
 		if keepaliveErr != nil {
 			s.finish(keepaliveErr)
@@ -297,6 +325,20 @@ func (s *staticKeyClientSession) readLoop() {
 	}
 }
 
+func (s *staticKeyClientSession) dataChannelMessages() *dataChannelMessageSender {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.closed {
+		return nil
+	}
+	if s.messages == nil {
+		s.messages = startDataChannelMessageSender(func(payload []byte) error {
+			return s.WriteDataPackets([][]byte{payload})
+		})
+	}
+	return s.messages
+}
+
 func (s *staticKeyClientSession) checkKeepalive(now time.Time) error {
 	s.access.Lock()
 	lastInboundTime := s.lastInboundTime
@@ -308,7 +350,10 @@ func (s *staticKeyClientSession) checkKeepalive(now time.Time) error {
 	}
 	pingInterval := s.parent.options.Timing.PingInterval
 	if pingInterval > 0 && !now.Before(lastOutboundTime.Add(pingInterval)) {
-		return s.WriteDataPackets([][]byte{openVPNDataChannelPingPayload})
+		messages := s.dataChannelMessages()
+		if messages != nil {
+			messages.sendPing()
+		}
 	}
 	return nil
 }

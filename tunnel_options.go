@@ -45,8 +45,7 @@ type pushedOptions struct {
 	KeyDerivation         string
 	ExplicitExitNotify    uint32
 	ExplicitExitNotifySet bool
-	Compression           string
-	CompressionLZO        string
+	CompressionDirectives []compressionDirective
 	InactiveTimeout       time.Duration
 	InactiveMinimumBytes  uint64
 	InactiveTimeoutSet    bool

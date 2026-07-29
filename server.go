@@ -175,6 +175,9 @@ func (s *Server) activeLoopContext() (context.Context, error) {
 		if s.static != nil {
 			return s.static.loopContext, nil
 		}
+		if !s.tls.isRunning() {
+			return nil, ErrServerClosed
+		}
 		return s.tls.loopContext, nil
 	case serverLifecycleClosing, serverLifecycleClosed:
 		return nil, ErrServerClosed
@@ -188,6 +191,9 @@ func (s *Server) requireRunning() error {
 	defer s.lifecycleAccess.Unlock()
 	switch s.lifecycleState {
 	case serverLifecycleRunning:
+		if s.tls != nil && !s.tls.isRunning() {
+			return ErrServerClosed
+		}
 		return nil
 	case serverLifecycleClosing, serverLifecycleClosed:
 		return ErrServerClosed

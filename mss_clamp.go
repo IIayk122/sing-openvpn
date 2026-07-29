@@ -1,6 +1,9 @@
 package openvpn
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math/bits"
+)
 
 const (
 	ipHeaderVersionIPv4 = 4
@@ -9,7 +12,10 @@ const (
 	ipv6HeaderLength    = 40
 	ipProtocolTCP       = 6
 
+	udpHeaderLength = 8
+
 	tcpHeaderMinLength = 20
+	tcpChecksumOffset  = 16
 	tcpFlagSYN         = 0x02
 	tcpOptionKindEnd   = 0
 	tcpOptionKindNOP   = 1
@@ -17,116 +23,132 @@ const (
 	tcpMSSOptionLength = 4
 )
 
-// Upstream mss_fixup_ipv4/mss_fixup_ipv6 treats the cap as IPv4 MSS;
-// IPv6 subtracts the 20-byte header delta before comparison.
-func clampTCPSegmentMSS(packet []byte, maxSegmentSize uint16) []byte {
-	if maxSegmentSize == 0 {
+// Upstream gates mss_fixup on the --mssfix option value rather than on the computed frame.mss_fix,
+// and casts that signed budget to uint16_t in mss_fixup_ipv4; mss_fixup_ipv6 casts maxmss-20 the
+// same way, so the cap is always expressed as an IPv4 MSS.
+type mssClamp struct {
+	enabled            bool
+	maximumSegmentSize uint16
+}
+
+func (c mssClamp) Apply(packet []byte) []byte {
+	if !c.enabled {
 		return packet
 	}
 	clonedPacket := append([]byte{}, packet...)
-	if !clampTCPSegmentMSSInPlace(clonedPacket, maxSegmentSize) {
+	if !c.ApplyInPlace(clonedPacket) {
 		return packet
 	}
 	return clonedPacket
 }
 
-func clampTCPSegmentMSSInPlace(packet []byte, maxSegmentSize uint16) bool {
-	if maxSegmentSize == 0 {
+func (c mssClamp) ApplyInPlace(packet []byte) bool {
+	if !c.enabled {
 		return false
 	}
-	effectiveMaxSegmentSize := maxSegmentSize
+	effectiveMaxSegmentSize := c.maximumSegmentSize
 	if len(packet) >= 1 && packet[0]>>4 == ipHeaderVersionIPv6 {
-		const ipv6MSSHeaderOverhead = ipv6HeaderLength - ipv4HeaderMinLength
-		if effectiveMaxSegmentSize <= ipv6MSSHeaderOverhead {
-			return false
-		}
-		effectiveMaxSegmentSize -= ipv6MSSHeaderOverhead
+		effectiveMaxSegmentSize -= ipv6HeaderLength - ipv4HeaderMinLength
 	}
-	tcpHeaderOffset, mssValueOffset, advertisedMSS, hasMSS := locateTCPSYNMSSOption(packet)
-	if !hasMSS || advertisedMSS <= effectiveMaxSegmentSize {
+	tcpSegment := locateTCPSYNSegment(packet)
+	if tcpSegment == nil {
 		return false
 	}
-	binary.BigEndian.PutUint16(packet[mssValueOffset:mssValueOffset+2], effectiveMaxSegmentSize)
-	checksumOffset := tcpHeaderOffset + 16
-	currentChecksum := binary.BigEndian.Uint16(packet[checksumOffset : checksumOffset+2])
-	updatedChecksum := incrementallyUpdateChecksum16(currentChecksum, advertisedMSS, effectiveMaxSegmentSize)
-	binary.BigEndian.PutUint16(packet[checksumOffset:checksumOffset+2], updatedChecksum)
-	return true
+	return clampTCPSYNSegmentMSS(tcpSegment, effectiveMaxSegmentSize)
 }
 
-func locateTCPSYNMSSOption(packet []byte) (tcpHeaderOffset int, mssValueOffset int, advertisedMSS uint16, hasMSS bool) {
+func locateTCPSYNSegment(packet []byte) []byte {
 	if len(packet) < 1 {
-		return 0, 0, 0, false
+		return nil
 	}
 	var ipHeaderLength int
 	switch packet[0] >> 4 {
 	case ipHeaderVersionIPv4:
 		if len(packet) < ipv4HeaderMinLength {
-			return 0, 0, 0, false
+			return nil
 		}
 		if int(binary.BigEndian.Uint16(packet[2:4])) != len(packet) || binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
-			return 0, 0, 0, false
+			return nil
 		}
 		ihl := int(packet[0]&0x0f) * 4
 		if ihl < ipv4HeaderMinLength || ihl > len(packet) {
-			return 0, 0, 0, false
+			return nil
 		}
 		if packet[9] != ipProtocolTCP {
-			return 0, 0, 0, false
+			return nil
 		}
 		ipHeaderLength = ihl
 	case ipHeaderVersionIPv6:
 		if len(packet) < ipv6HeaderLength {
-			return 0, 0, 0, false
+			return nil
 		}
 		if int(binary.BigEndian.Uint16(packet[4:6]))+ipv6HeaderLength != len(packet) {
-			return 0, 0, 0, false
+			return nil
 		}
 		if packet[6] != ipProtocolTCP {
-			return 0, 0, 0, false
+			return nil
 		}
 		ipHeaderLength = ipv6HeaderLength
 	default:
-		return 0, 0, 0, false
+		return nil
 	}
 	tcpSegment := packet[ipHeaderLength:]
 	if len(tcpSegment) < tcpHeaderMinLength {
-		return 0, 0, 0, false
-	}
-	dataOffset := int(tcpSegment[12]>>4) * 4
-	if dataOffset < tcpHeaderMinLength || dataOffset > len(tcpSegment) {
-		return 0, 0, 0, false
+		return nil
 	}
 	if tcpSegment[13]&tcpFlagSYN == 0 {
-		return 0, 0, 0, false
+		return nil
 	}
-	optionsArea := tcpSegment[tcpHeaderMinLength:dataOffset]
-	optionOffset := 0
-	for optionOffset < len(optionsArea) {
-		kind := optionsArea[optionOffset]
+	return tcpSegment
+}
+
+func clampTCPSYNSegmentMSS(tcpSegment []byte, maxSegmentSize uint16) bool {
+	dataOffset := int(tcpSegment[12]>>4) * 4
+	if dataOffset < tcpHeaderMinLength || dataOffset > len(tcpSegment) {
+		return false
+	}
+	clamped := false
+	optionOffset := tcpHeaderMinLength
+	for optionOffset < dataOffset {
+		kind := tcpSegment[optionOffset]
 		if kind == tcpOptionKindEnd {
-			return 0, 0, 0, false
+			break
 		}
 		if kind == tcpOptionKindNOP {
 			optionOffset++
 			continue
 		}
-		if optionOffset+1 >= len(optionsArea) {
-			return 0, 0, 0, false
+		if optionOffset+1 >= dataOffset {
+			break
 		}
-		length := int(optionsArea[optionOffset+1])
-		if length < 2 || optionOffset+length > len(optionsArea) {
-			return 0, 0, 0, false
+		optionLength := int(tcpSegment[optionOffset+1])
+		if optionLength < 2 || optionOffset+optionLength > dataOffset {
+			break
 		}
-		if kind == tcpOptionKindMSS && length == tcpMSSOptionLength {
-			advertisedMSS = binary.BigEndian.Uint16(optionsArea[optionOffset+2 : optionOffset+4])
-			tcpHeaderOffset = ipHeaderLength
-			mssValueOffset = ipHeaderLength + tcpHeaderMinLength + optionOffset + 2
-			return tcpHeaderOffset, mssValueOffset, advertisedMSS, true
+		if kind != tcpOptionKindMSS || optionLength != tcpMSSOptionLength {
+			optionOffset += optionLength
+			continue
 		}
-		optionOffset += length
+		valueOffset := optionOffset + 2
+		advertisedMSS := binary.BigEndian.Uint16(tcpSegment[valueOffset : valueOffset+2])
+		if advertisedMSS > maxSegmentSize {
+			binary.BigEndian.PutUint16(tcpSegment[valueOffset:valueOffset+2], maxSegmentSize)
+			updateTCPChecksumForFieldRewrite(tcpSegment, valueOffset, advertisedMSS, maxSegmentSize)
+			clamped = true
+		}
+		optionOffset += optionLength
 	}
-	return 0, 0, 0, false
+	return clamped
+}
+
+func updateTCPChecksumForFieldRewrite(tcpSegment []byte, fieldOffset int, previousValue uint16, updatedValue uint16) {
+	if fieldOffset%2 != 0 {
+		previousValue = bits.ReverseBytes16(previousValue)
+		updatedValue = bits.ReverseBytes16(updatedValue)
+	}
+	currentChecksum := binary.BigEndian.Uint16(tcpSegment[tcpChecksumOffset : tcpChecksumOffset+2])
+	updatedChecksum := incrementallyUpdateChecksum16(currentChecksum, previousValue, updatedValue)
+	binary.BigEndian.PutUint16(tcpSegment[tcpChecksumOffset:tcpChecksumOffset+2], updatedChecksum)
 }
 
 func incrementallyUpdateChecksum16(currentChecksum uint16, oldWord uint16, newWord uint16) uint16 {

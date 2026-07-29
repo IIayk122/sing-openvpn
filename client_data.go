@@ -5,13 +5,14 @@ import (
 	"sync/atomic"
 
 	"github.com/sagernet/sing/common/buf"
-	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type clientDataPlane struct {
 	framing                    atomic.Pointer[dataChannelFraming]
 	incomingPacketDropLog      droppedPacketLog
+	outgoingPacketDropLog      droppedPacketLog
 	allowCompressionPolicy     allowCompressionPolicy
+	compression                compressionSettings
 	incomingDataPackets        *dataPacketQueue[*buf.Buffer]
 	droppedIncomingDataPackets atomic.Uint64
 }
@@ -94,10 +95,12 @@ func (c *Client) DroppedIncomingDataPackets() uint64 {
 	return c.dataPlane.droppedIncomingDataPackets.Load()
 }
 
-func (c *Client) outgoingDataPayloadBatches(payloads [][]byte, codec dataCodec, packetHeaderSize int, outerTransportOverhead int) ([][][]byte, error) {
+// fragment_outgoing (fragment.c) reports the datagram it cannot frame through
+// D_FRAG_ERRORS and zeroes its buffer, which drops that datagram alone.
+func (c *Client) outgoingDataPayloadBatches(payloads [][]byte, codec dataCodec, packetHeaderSize int, outerTransportOverhead int) [][][]byte {
 	dataFraming := c.dataPlane.framing.Load()
 	dataChannelOptions := c.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		dataFraming,
@@ -105,39 +108,32 @@ func (c *Client) outgoingDataPayloadBatches(payloads [][]byte, codec dataCodec, 
 		packetHeaderSize,
 		outerTransportOverhead,
 	)
-	if err != nil {
-		return nil, err
-	}
-	outgoingPayloadBatches := make([][][]byte, 0, len(payloads))
+	outgoingPayloadBatches := make([][][]byte, len(payloads))
 	if dataFraming == nil {
-		for _, payload := range payloads {
-			clampedPayload := clampTCPSegmentMSS(payload, maximumSegmentSize)
-			outgoingPayloadBatches = append(outgoingPayloadBatches, [][]byte{append([]byte{}, clampedPayload...)})
+		for i, payload := range payloads {
+			outgoingPayloadBatches[i] = [][]byte{append([]byte{}, clamp.Apply(payload)...)}
 		}
-		return outgoingPayloadBatches, nil
+		return outgoingPayloadBatches
 	}
 	fragmentSize := 0
-	if c.options.DataChannel.Fragment > 0 {
-		fragmentSize, err = calculateDataPayloadSize(int(c.options.DataChannel.Fragment), codec, packetHeaderSize, 4)
-		if err != nil {
-			return nil, err
-		}
+	if dataChannelOptions.Fragment > 0 {
+		fragmentSize = calculateDataPayloadBudget(int(dataChannelOptions.Fragment), codec, packetHeaderSize, 4)
 	}
-	for _, payload := range payloads {
-		clampedPayload := clampTCPSegmentMSS(payload, maximumSegmentSize)
-		outgoingPayloads, encodeErr := dataFraming.Encode(clampedPayload, fragmentSize)
+	for i, payload := range payloads {
+		outgoingPayloads, encodeErr := dataFraming.Encode(clamp.Apply(payload), fragmentSize)
 		if encodeErr != nil {
-			return outgoingPayloadBatches, encodeErr
+			c.dataPlane.outgoingPacketDropLog.Log(encodeErr)
+			continue
 		}
-		outgoingPayloadBatches = append(outgoingPayloadBatches, outgoingPayloads)
+		outgoingPayloadBatches[i] = outgoingPayloads
 	}
-	return outgoingPayloadBatches, nil
+	return outgoingPayloadBatches
 }
 
-func (c *Client) outgoingDataBufferBatches(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int, outerTransportOverhead int) ([][]*buf.Buffer, error) {
+func (c *Client) outgoingDataBufferBatches(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int, outerTransportOverhead int) [][]*buf.Buffer {
 	dataFraming := c.dataPlane.framing.Load()
 	dataChannelOptions := c.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		dataFraming,
@@ -145,40 +141,25 @@ func (c *Client) outgoingDataBufferBatches(payloads []*buf.Buffer, codec dataCod
 		packetHeaderSize,
 		outerTransportOverhead,
 	)
-	if err != nil {
-		buf.ReleaseMulti(payloads)
-		return nil, err
-	}
+	outgoingPayloadBatches := make([][]*buf.Buffer, len(payloads))
 	if dataFraming == nil {
-		outgoingPayloadBatches := make([][]*buf.Buffer, len(payloads))
-		outgoingPayloads := make([]*buf.Buffer, len(payloads))
 		for i, payload := range payloads {
-			clampTCPSegmentMSSInPlace(payload.Bytes(), maximumSegmentSize)
-			outgoingPayloads[i] = payload
-			outgoingPayloadBatches[i] = outgoingPayloads[i : i+1]
+			clamp.ApplyInPlace(payload.Bytes())
+			outgoingPayloadBatches[i] = []*buf.Buffer{payload}
 		}
-		return outgoingPayloadBatches, nil
+		return outgoingPayloadBatches
 	}
 	fragmentSize := 0
-	if c.options.DataChannel.Fragment > 0 {
-		fragmentSize, err = calculateDataPayloadSize(int(c.options.DataChannel.Fragment), codec, packetHeaderSize, 4)
-		if err != nil {
-			buf.ReleaseMulti(payloads)
-			return nil, err
-		}
+	if dataChannelOptions.Fragment > 0 {
+		fragmentSize = calculateDataPayloadBudget(int(dataChannelOptions.Fragment), codec, packetHeaderSize, 4)
 	}
-	outgoingPayloadBatches := make([][]*buf.Buffer, 0, len(payloads))
 	for i, payload := range payloads {
-		clampedPayload := clampTCPSegmentMSS(payload.Bytes(), maximumSegmentSize)
-		outgoingPayloads, encodeErr := dataFraming.Encode(clampedPayload, fragmentSize)
+		outgoingPayloads, encodeErr := dataFraming.Encode(clamp.Apply(payload.Bytes()), fragmentSize)
 		headroom := payload.Start()
 		payload.Release()
 		if encodeErr != nil {
-			buf.ReleaseMulti(payloads[i+1:])
-			for _, outgoingPayloadBatch := range outgoingPayloadBatches {
-				buf.ReleaseMulti(outgoingPayloadBatch)
-			}
-			return nil, encodeErr
+			c.dataPlane.outgoingPacketDropLog.Log(encodeErr)
+			continue
 		}
 		outgoingPayloadBuffers := make([]*buf.Buffer, len(outgoingPayloads))
 		for j, outgoingPayload := range outgoingPayloads {
@@ -187,15 +168,15 @@ func (c *Client) outgoingDataBufferBatches(payloads []*buf.Buffer, codec dataCod
 			_, _ = outgoingPayloadBuffer.Write(outgoingPayload)
 			outgoingPayloadBuffers[j] = outgoingPayloadBuffer
 		}
-		outgoingPayloadBatches = append(outgoingPayloadBatches, outgoingPayloadBuffers)
+		outgoingPayloadBatches[i] = outgoingPayloadBuffers
 	}
-	return outgoingPayloadBatches, nil
+	return outgoingPayloadBatches
 }
 
-func calculateDataPayloadSize(packetSize int, codec dataCodec, packetHeaderSize int, fixedPayloadSize int) (int, error) {
+func calculateDataPayloadBudget(packetSize int, codec dataCodec, packetHeaderSize int, fixedPayloadSize int) int {
 	minimumPacketLength := packetHeaderSize + codec.EncodedLength(fixedPayloadSize)
 	if minimumPacketLength >= packetSize {
-		return 0, E.New("data packet size is too small for channel overhead")
+		return packetSize - minimumPacketLength
 	}
 	minimumPayloadSize := 1
 	maximumPayloadSize := packetSize
@@ -208,7 +189,7 @@ func calculateDataPayloadSize(packetSize int, codec dataCodec, packetHeaderSize 
 			maximumPayloadSize = candidatePayloadSize - 1
 		}
 	}
-	return minimumPayloadSize, nil
+	return minimumPayloadSize
 }
 
 func (c *Client) decodeIncomingDataFraming(payload []byte) ([]byte, bool, error) {
@@ -237,7 +218,7 @@ func (c *Client) handleIncomingDataPayloads(payloads [][]byte, codec dataCodec, 
 		return
 	}
 	dataChannelOptions := c.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		c.dataPlane.framing.Load(),
@@ -245,12 +226,9 @@ func (c *Client) handleIncomingDataPayloads(payloads [][]byte, codec dataCodec, 
 		packetHeaderSize,
 		outerTransportOverhead,
 	)
-	if err != nil {
-		return
-	}
 	clampedPayloads := make([][]byte, 0, len(payloads))
 	for _, payload := range payloads {
-		clampedPayloads = append(clampedPayloads, clampTCPSegmentMSS(payload, maximumSegmentSize))
+		clampedPayloads = append(clampedPayloads, clamp.Apply(payload))
 	}
 	c.pushIncomingDataPackets(clampedPayloads)
 }
@@ -260,7 +238,7 @@ func (c *Client) handleIncomingDataBuffers(payloads []*buf.Buffer, codec dataCod
 		return
 	}
 	dataChannelOptions := c.options.DataChannel
-	maximumSegmentSize, err := calculateMaximumSegmentSize(
+	clamp := calculateMSSClamp(
 		dataChannelOptions.MSSFix,
 		dataChannelOptions.MSSFixMode,
 		c.dataPlane.framing.Load(),
@@ -268,12 +246,8 @@ func (c *Client) handleIncomingDataBuffers(payloads []*buf.Buffer, codec dataCod
 		packetHeaderSize,
 		outerTransportOverhead,
 	)
-	if err != nil {
-		buf.ReleaseMulti(payloads)
-		return
-	}
 	for _, payload := range payloads {
-		clampTCPSegmentMSSInPlace(payload.Bytes(), maximumSegmentSize)
+		clamp.ApplyInPlace(payload.Bytes())
 	}
 	c.pushIncomingDataBuffers(payloads)
 }

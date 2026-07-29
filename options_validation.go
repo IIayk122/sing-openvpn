@@ -386,9 +386,6 @@ func validateDataChannelPolicy(optionsName string, mssFix uint32, mssFixDisabled
 	if mssFix == 0 && mssFixMode != "" {
 		return E.New(optionsName, ".MSSFixMode requires MSSFix")
 	}
-	if mssFix > 0 && mssFix < 154 {
-		return E.New(optionsName, ".MSSFix must be zero or at least 154")
-	}
 	switch mssFixMode {
 	case "", MSSFixModeMTU, MSSFixModeFixed:
 	default:
@@ -411,11 +408,32 @@ func validateServerResourceOptions(options ServerOptions) error {
 	if resourceOptions.MaxClients < 0 {
 		return E.New("ServerOptions.Resources.MaxClients must not be negative")
 	}
-	if resourceOptions.MaxClients >= 1<<24 {
-		return E.New("ServerOptions.Resources.MaxClients must fit in the 24-bit OpenVPN peer-id space")
+	if resourceOptions.MaxClients >= peerIDMaxValue {
+		return E.New("ServerOptions.Resources.MaxClients must be less than ", peerIDMaxValue)
 	}
 	if options.Mode == ModeStaticKey && resourceOptions.MaxClients > 1 {
 		return E.New("ServerOptions.Resources.MaxClients must not exceed 1 in static_key mode")
+	}
+	if resourceOptions.ConnectFrequency < 0 {
+		return E.New("ServerOptions.Resources.ConnectFrequency must not be negative")
+	}
+	if resourceOptions.ConnectFrequency > 0 && resourceOptions.ConnectFrequencyPeriod <= 0 {
+		return E.New("ServerOptions.Resources.ConnectFrequency requires ConnectFrequencyPeriod")
+	}
+	if resourceOptions.ConnectFrequencyPeriod < 0 {
+		return E.New("ServerOptions.Resources.ConnectFrequencyPeriod must not be negative")
+	}
+	if resourceOptions.ConnectFrequencyPeriod > 0 && !strings.HasPrefix(options.Transport.Protocol, "udp") {
+		return E.New("ServerOptions.Resources.ConnectFrequency is only supported by UDP servers")
+	}
+	if resourceOptions.InitialConnectFrequency < 0 {
+		return E.New("ServerOptions.Resources.InitialConnectFrequency must not be negative")
+	}
+	if resourceOptions.InitialConnectFrequency > 0 && resourceOptions.InitialConnectFrequencyPeriod <= 0 {
+		return E.New("ServerOptions.Resources.InitialConnectFrequency requires InitialConnectFrequencyPeriod")
+	}
+	if resourceOptions.InitialConnectFrequencyPeriod < 0 {
+		return E.New("ServerOptions.Resources.InitialConnectFrequencyPeriod must not be negative")
 	}
 	return nil
 }

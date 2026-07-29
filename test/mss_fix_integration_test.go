@@ -12,6 +12,7 @@ import (
 )
 
 func TestMSSFixClientServerDataPathIntegration(t *testing.T) {
+	t.Parallel()
 	testCases := []struct {
 		name           string
 		protocol       string
@@ -194,7 +195,7 @@ func exchangeMSSFixPacket(t *testing.T, server *openvpn.Server, client *openvpn.
 func buildTCPSYNPacket(t *testing.T, source netip.Addr, destination netip.Addr, segmentSize uint16) []byte {
 	t.Helper()
 	if source.Is4() && destination.Is4() {
-		return buildIPv4TCPSYNPacket(t, source, destination, 40000, 443, segmentSize)
+		return buildIPv4TCPSYNPacket(t, source, destination, 40000, 443, segmentSize, 0)
 	}
 	if !source.Is6() || !destination.Is6() {
 		t.Fatal("TCP SYN address families do not match")

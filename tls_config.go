@@ -3,9 +3,7 @@ package openvpn
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/asn1"
 	"encoding/pem"
-	"fmt"
 	"os"
 	"strings"
 
@@ -170,7 +168,7 @@ func buildTLSClientConfiguration(options ClientOptions) (*tls.Config, error) {
 	tlsCipherSuites = applyCertificateProfileTLSCipherDefault(certProfile, tlsCipherSuites)
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
 		Roots:                    rootCAs,
-		KeyUsage:                 resolveVerificationExtKeyUsage(requiredExtUsage, x509.ExtKeyUsageServerAuth),
+		Purpose:                  certificatePurposeSSLServer,
 		VerifyName:               tlsOptions.VerifyX509Name,
 		VerifyNameType:           tlsOptions.VerifyX509Type,
 		PeerFingerprints:         tlsOptions.PeerFingerprint,
@@ -229,7 +227,7 @@ func loadOptionalClientCertificate(certificateMaterial Material, key Material, c
 		}
 		localChain = append(localChain, certificate)
 	}
-	err = enforceCertificateProfile([][]*x509.Certificate{localChain}, certificateProfile)
+	err = enforceCertificateProfile(localChain, certificateProfile)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +293,7 @@ func buildTLSServerConfiguration(options ServerOptions) (*tls.Config, error) {
 	tlsCipherSuites = applyCertificateProfileTLSCipherDefault(certProfile, tlsCipherSuites)
 	verifier := &peerCertificateVerifier{options: peerCertificateVerifierOptions{
 		Roots:                    rootCAs,
-		KeyUsage:                 resolveVerificationExtKeyUsage(requiredExtUsage, x509.ExtKeyUsageClientAuth),
+		Purpose:                  certificatePurposeSSLClient,
 		VerifyName:               tlsOptions.VerifyX509Name,
 		VerifyNameType:           tlsOptions.VerifyX509Type,
 		PeerFingerprints:         tlsOptions.PeerFingerprint,
@@ -401,101 +399,6 @@ func requireCAOrPeerFingerprint(roots *certificatePool, peerFingerprints []strin
 		return nil
 	}
 	return ErrMissingCAOrPeerFingerprint
-}
-
-// Upstream verify_cert_call_plugin/parse_verify_x509_name (ssl_verify.c/options.c)
-// supports subject, name, and name-prefix.
-func verifyX509NameMatch(peerCertificate *x509.Certificate, expectedName string, verifyType string) error {
-	if expectedName == "" || peerCertificate == nil {
-		return nil
-	}
-	switch verifyType {
-	case "", "subject":
-		actualSubject := formatOpenVPNSubject(peerCertificate)
-		if actualSubject != expectedName {
-			return E.New("peer certificate name mismatch")
-		}
-	case "name":
-		if peerCertificate.Subject.CommonName != expectedName {
-			return E.New("peer certificate name mismatch")
-		}
-	case "name-prefix":
-		if !strings.HasPrefix(peerCertificate.Subject.CommonName, expectedName) {
-			return E.New("peer certificate name mismatch")
-		}
-	default:
-		return E.New("unknown X.509 name type: ", verifyType)
-	}
-	return nil
-}
-
-// Upstream x509_get_subject (ssl_verify_openssl.c) uses
-// XN_FLAG_SEP_CPLUS_SPC | XN_FLAG_FN_SN.
-func formatOpenVPNSubject(peerCertificate *x509.Certificate) string {
-	if peerCertificate == nil {
-		return ""
-	}
-	rdnSequence := peerCertificate.Subject.ToRDNSequence()
-	builder := strings.Builder{}
-	first := true
-	for _, relativeDistinguishedName := range rdnSequence {
-		for _, attributeTypeAndValue := range relativeDistinguishedName {
-			if !first {
-				builder.WriteString(", ")
-			}
-			first = false
-			builder.WriteString(openVPNShortName(attributeTypeAndValue.Type))
-			builder.WriteByte('=')
-			builder.WriteString(stringFromAttributeValue(attributeTypeAndValue.Value))
-		}
-	}
-	return builder.String()
-}
-
-// Upstream X509_NAME_print_ex short-name rendering (ssl_verify_openssl.c).
-func openVPNShortName(attributeOID asn1.ObjectIdentifier) string {
-	switch attributeOID.String() {
-	case "2.5.4.3":
-		return "CN"
-	case "2.5.4.4":
-		return "SN"
-	case "2.5.4.5":
-		return "serialNumber"
-	case "2.5.4.6":
-		return "C"
-	case "2.5.4.7":
-		return "L"
-	case "2.5.4.8":
-		return "ST"
-	case "2.5.4.9":
-		return "street"
-	case "2.5.4.10":
-		return "O"
-	case "2.5.4.11":
-		return "OU"
-	case "2.5.4.12":
-		return "title"
-	case "2.5.4.17":
-		return "postalCode"
-	case "2.5.4.42":
-		return "GN"
-	case "2.5.4.46":
-		return "dnQualifier"
-	case "0.9.2342.19200300.100.1.1":
-		return "UID"
-	case "0.9.2342.19200300.100.1.25":
-		return "DC"
-	case "1.2.840.113549.1.9.1":
-		return "emailAddress"
-	}
-	return attributeOID.String()
-}
-
-func stringFromAttributeValue(value any) string {
-	if stringValue, isString := value.(string); isString {
-		return stringValue
-	}
-	return fmt.Sprint(value)
 }
 
 // Upstream tls_get_cipher_name_pair accepts OpenSSL and IANA names for

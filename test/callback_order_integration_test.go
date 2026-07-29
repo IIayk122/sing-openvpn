@@ -13,6 +13,7 @@ import (
 )
 
 func TestTunnelConfigurationCallbacksRemainOrderedAcrossReconnect(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	firstServerContext, cancelFirstServerContext := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancelFirstServerContext()
@@ -99,6 +100,7 @@ func TestTunnelConfigurationCallbacksRemainOrderedAcrossReconnect(t *testing.T) 
 }
 
 func TestClientCloseDropsQueuedTunnelConfigurationCallbacksWithoutWaitingForActive(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	firstServerContext, cancelFirstServerContext := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancelFirstServerContext()

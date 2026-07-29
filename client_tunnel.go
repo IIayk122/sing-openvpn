@@ -337,13 +337,13 @@ func (c *Client) setInitialTunnelEventDeferred(deferred bool) {
 }
 
 func (c *Client) clearAuthToken() bool {
-	interactiveUsername := c.interactiveUsername()
+	stagedUsername := c.loadStagedCredentials().username
 	c.tunnel.access.Lock()
 	tokenConfiguration := TunnelConfiguration{
 		AuthToken:     c.tunnel.authToken,
 		AuthTokenUser: c.tunnel.authTokenUser,
 	}
-	_, _, tokenDefined := resolveAuthTokenCredentials(c.options, tokenConfiguration, interactiveUsername)
+	_, _, tokenDefined := resolveAuthTokenCredentials(c.options, tokenConfiguration, stagedUsername)
 	c.tunnel.authToken = ""
 	c.tunnel.authTokenUser = ""
 	c.tunnel.configuration.AuthToken = ""
@@ -353,43 +353,36 @@ func (c *Client) clearAuthToken() bool {
 }
 
 func (c *Client) maybeReconfigureDataFramingFromPushedOptions(options pushedOptions) {
-	pushedCompression := strings.TrimSpace(options.Compression)
-	pushedCompressionLZO := strings.TrimSpace(options.CompressionLZO)
-	if pushedCompression == "" && pushedCompressionLZO == "" {
+	if len(options.CompressionDirectives) == 0 {
 		return
 	}
-	// Upstream check_compression_settings_valid (comp.c) rejects
-	// non-stub pushed compression under --allow-compression no.
-	if c.dataPlane.allowCompressionPolicy == allowCompressionStubOnly && !compressionFramingIsStub(pushedCompression, pushedCompressionLZO) {
-		rejectionParts := make([]string, 0, 2)
-		if pushedCompression != "" {
-			rejectionParts = append(rejectionParts, "compress "+pushedCompression)
+	// Upstream apply_push_options (options.c) replays every pushed compress
+	// and comp-lzo directive through add_option in wire order, on top of the
+	// compression state the local configuration already established.
+	pushedCompression := c.dataPlane.compression
+	rejectionParts := make([]string, 0, len(options.CompressionDirectives))
+	for _, directive := range options.CompressionDirectives {
+		rejectionPart := directive.Name
+		if directive.Value != "" {
+			rejectionPart += " " + directive.Value
 		}
-		if pushedCompressionLZO != "" {
-			rejectionParts = append(rejectionParts, "comp-lzo "+pushedCompressionLZO)
+		rejectionParts = append(rejectionParts, rejectionPart)
+		err := pushedCompression.apply(directive)
+		if err != nil {
+			c.tunnel.compressionPushRejection = strings.Join(rejectionParts, "; ")
+			return
 		}
+	}
+	// Upstream check_compression_settings_valid (comp.c) rejects the merged
+	// compression state whenever it is non-stub under --allow-compression no.
+	if c.dataPlane.allowCompressionPolicy == allowCompressionStubOnly && pushedCompression.nonStubEnabled() {
 		c.tunnel.compressionPushRejection = strings.Join(rejectionParts, "; ")
 		return
 	}
-	effectiveCompression := c.options.DataChannel.Compression
-	if pushedCompression != "" {
-		effectiveCompression = pushedCompression
-	}
-	effectiveCompressionLZO := c.options.DataChannel.CompressionLZO
-	if pushedCompressionLZO != "" {
-		effectiveCompressionLZO = pushedCompressionLZO
-	}
-	if effectiveCompression == c.options.DataChannel.Compression &&
-		effectiveCompressionLZO == c.options.DataChannel.CompressionLZO {
+	if pushedCompression == c.dataPlane.compression {
 		return
 	}
-	if validateCompressionOptions(effectiveCompression, effectiveCompressionLZO) != nil {
-		return
-	}
-	syntheticOptions := c.options
-	syntheticOptions.DataChannel.Compression = effectiveCompression
-	syntheticOptions.DataChannel.CompressionLZO = effectiveCompressionLZO
-	c.dataPlane.framing.Store(newDataChannelFraming(syntheticOptions, c.dataPlane.allowCompressionPolicy))
+	c.dataPlane.framing.Store(newDataChannelFraming(pushedCompression, c.options.DataChannel.Fragment, c.dataPlane.allowCompressionPolicy))
 }
 
 func (c *Client) warnPushedOptionParseErrors(parseErrors []pushedOptionParseError) {

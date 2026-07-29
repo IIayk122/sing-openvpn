@@ -13,9 +13,13 @@ import (
 	openvpn "github.com/sagernet/sing-openvpn"
 )
 
+const staleSessionPingRestart = 3 * time.Second
+
 func TestOpenVPNInteropLongRunningServerStaleSessionNewClientAfterAuth(t *testing.T) {
+	t.Parallel()
 	for _, version := range []string{"2.4.12", "2.5.11", "2.6.14"} {
 		t.Run("openvpn_"+version, func(t *testing.T) {
+			t.Parallel()
 			runOpenVPNInteropLongRunningServerStaleSessionNewClientAfterAuth(t, requireInteropEnvironmentVersion(t, version))
 		})
 	}
@@ -28,7 +32,7 @@ func runOpenVPNInteropLongRunningServerStaleSessionNewClientAfterAuth(t *testing
 		dumpInteropLogs(t, workspace)
 	})
 
-	listenPort := reserveUDPPort(t)
+	listenPort := reserveInteropPort(t, "udp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancelServerContext()
 	var authenticationCount atomic.Uint32
@@ -57,7 +61,7 @@ func runOpenVPNInteropLongRunningServerStaleSessionNewClientAfterAuth(t *testing
 		}},
 		Timing: openvpn.ServerTimingOptions{
 			PingInterval: time.Second,
-			PingRestart:  5 * time.Second,
+			PingRestart:  staleSessionPingRestart,
 		},
 		Tunnel: openvpn.ServerTunnelOptions{
 			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.8.0.0/24")},
@@ -81,7 +85,7 @@ func runOpenVPNInteropLongRunningServerStaleSessionNewClientAfterAuth(t *testing
 	firstConfigurationPath := filepath.Join(workspace.renderedDir, "stale-first-client.conf")
 	renderStaleSessionInteropClient(t, firstConfigurationPath, firstLogPath, listenPort, dataCiphersDirective)
 	firstClient := startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:       "sing-openvpn-stale-first-client-" + sanitizeDockerName(t.Name()),
+		Name:       "sing-openvpn-stale-first-client-" + uniqueDockerName(t.Name()),
 		Image:      env.image,
 		Command:    []string{"bash", "-lc", "exec openvpn --config " + filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "stale-first-client.conf")) + " --connect-timeout 5 --connect-retry-max 1 --hand-window 5"},
 		Binds:      []string{workspace.root + ":" + openVPNInteropRoot},
@@ -96,7 +100,7 @@ func runOpenVPNInteropLongRunningServerStaleSessionNewClientAfterAuth(t *testing
 	if err != nil {
 		t.Fatalf("force-remove first OpenVPN client: %v", err)
 	}
-	time.Sleep(8 * time.Second)
+	time.Sleep(staleSessionPingRestart + 1500*time.Millisecond)
 
 	secondLogPath := filepath.Join(workspace.logsDir, "new-second-client.log")
 	secondConfigurationPath := filepath.Join(workspace.renderedDir, "new-second-client.conf")
@@ -105,7 +109,7 @@ func runOpenVPNInteropLongRunningServerStaleSessionNewClientAfterAuth(t *testing
 	secondClientLog := filepath.ToSlash(filepath.Join(openVPNInteropRoot, "logs", "new-second-client.log"))
 	secondClientPID := filepath.ToSlash(filepath.Join(openVPNInteropRoot, "new-second-client.pid"))
 	secondClient := startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:       "sing-openvpn-stale-second-client-" + sanitizeDockerName(t.Name()),
+		Name:       "sing-openvpn-stale-second-client-" + uniqueDockerName(t.Name()),
 		Image:      env.image,
 		Command:    []string{"bash", "-lc", "openvpn --config " + secondContainerConfiguration + " --daemon --writepid " + secondClientPID + " && until grep -q 'Initialization Sequence Completed' " + secondClientLog + "; do sleep 0.1; done && ping -c 1 -W 3 10.8.0.1"},
 		Binds:      []string{workspace.root + ":" + openVPNInteropRoot},
@@ -163,7 +167,7 @@ func waitForAuthenticationCount(t *testing.T, count *atomic.Uint32, expected uin
 		if count.Load() >= expected {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(interopPollInterval)
 	}
 	t.Fatalf("timed out waiting for %d successful authentications; got %d", expected, count.Load())
 }

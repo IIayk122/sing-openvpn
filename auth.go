@@ -31,54 +31,27 @@ func authPendingDeadline(options ClientOptions, controlRecord []byte) time.Time 
 	return time.Now().Add(extension)
 }
 
+// Upstream auth_user_pass_setup (ssl.c) fills auth_user_pass once, before the
+// connection attempt and only while it is undefined, and get_user_pass_cr
+// (misc.c) packs the static or dynamic challenge answer into its password field
+// at that point. The record is what every key_method_2_write sends, survives
+// failed attempts and renegotiations, and is dropped only by ssl_purge_auth.
+type stagedCredentials struct {
+	defined     bool
+	interactive bool
+	username    string
+	password    string
+}
+
 func (c *Client) sessionCredentials(useActiveAuthToken bool) (string, string) {
+	staged := c.loadStagedCredentials()
 	if useActiveAuthToken {
-		c.tunnel.access.RLock()
-		tokenConfiguration := TunnelConfiguration{
-			AuthToken:     c.tunnel.authToken,
-			AuthTokenUser: c.tunnel.authTokenUser,
-		}
-		c.tunnel.access.RUnlock()
-		tokenUsername, tokenPassword, tokenDefined := resolveAuthTokenCredentials(c.options, tokenConfiguration, c.interactiveUsername())
+		tokenUsername, tokenPassword, tokenDefined := c.activeAuthTokenCredentials(staged.username)
 		if tokenDefined {
 			return c.noteSentCredentials(tokenUsername, tokenPassword, false)
 		}
 	}
-	c.authentication.access.Lock()
-	challengeUsername := c.authentication.challengeResponseUsername
-	challengePassword := c.authentication.challengeResponsePassword
-	c.authentication.challengeResponseUsername = ""
-	c.authentication.challengeResponsePassword = ""
-	interactiveUsername := c.authentication.interactiveUsername
-	interactivePassword := c.authentication.interactivePassword
-	interactiveSecret := c.authentication.interactiveSecret
-	c.authentication.access.Unlock()
-	usedInteractive := false
-	username := c.options.Authentication.Username
-	if username == "" && interactiveUsername != "" {
-		username = interactiveUsername
-		usedInteractive = true
-	}
-	if challengePassword != "" {
-		if challengeUsername != "" {
-			username = challengeUsername
-		}
-		return c.noteSentCredentials(username, challengePassword, true)
-	}
-	password := c.options.Authentication.Password
-	if password == "" && interactivePassword != "" {
-		password = interactivePassword
-		usedInteractive = true
-	}
-	challengeResponse := interactiveSecret
-	if challengeResponse != "" {
-		usedInteractive = true
-		// Upstream get_user_pass_static_challenge uses SCRV1 for static challenges.
-		encodedPassword := base64.StdEncoding.EncodeToString([]byte(password))
-		encodedResponse := base64.StdEncoding.EncodeToString([]byte(challengeResponse))
-		password = "SCRV1:" + encodedPassword + ":" + encodedResponse
-	}
-	return c.noteSentCredentials(username, password, usedInteractive)
+	return c.noteSentCredentials(staged.username, staged.password, staged.interactive)
 }
 
 func (c *Client) noteSentCredentials(username string, password string, usedInteractive bool) (string, string) {
@@ -94,43 +67,42 @@ func (c *Client) lastSentCredentialsInteractive() bool {
 	return c.authentication.sentInteractiveCredentials
 }
 
-func (c *Client) interactiveUsername() string {
+func (c *Client) loadStagedCredentials() stagedCredentials {
 	c.authentication.access.Lock()
 	defer c.authentication.access.Unlock()
-	return c.authentication.interactiveUsername
+	return c.authentication.staged
 }
 
-func (c *Client) setInteractiveUserPass(username string, password string) {
+func (c *Client) stageCredentials(username string, password string, interactive bool) {
 	c.authentication.access.Lock()
-	c.authentication.interactiveUsername = username
-	c.authentication.interactivePassword = password
+	c.authentication.staged = stagedCredentials{
+		defined:     true,
+		interactive: interactive,
+		username:    username,
+		password:    password,
+	}
 	c.authentication.access.Unlock()
 }
 
-func (c *Client) setInteractiveSecret(secret string) {
+// Upstream ssl_purge_auth (ssl.c) drops auth_user_pass so that the next
+// auth_user_pass_setup queries the credentials again.
+func (c *Client) purgeStagedCredentials() {
 	c.authentication.access.Lock()
-	c.authentication.interactiveSecret = secret
+	c.authentication.staged = stagedCredentials{}
 	c.authentication.access.Unlock()
 }
 
-func (c *Client) setChallengeResponseCredentials(username string, password string) {
-	c.authentication.access.Lock()
-	c.authentication.challengeResponseUsername = username
-	c.authentication.challengeResponsePassword = password
-	c.authentication.access.Unlock()
+func (c *Client) activeAuthTokenCredentials(fallbackUsername string) (string, string, bool) {
+	c.tunnel.access.RLock()
+	tokenConfiguration := TunnelConfiguration{
+		AuthToken:     c.tunnel.authToken,
+		AuthTokenUser: c.tunnel.authTokenUser,
+	}
+	c.tunnel.access.RUnlock()
+	return resolveAuthTokenCredentials(c.options, tokenConfiguration, fallbackUsername)
 }
 
-func (c *Client) clearInteractiveCredentials() {
-	c.authentication.access.Lock()
-	c.authentication.interactiveUsername = ""
-	c.authentication.interactivePassword = ""
-	c.authentication.interactiveSecret = ""
-	c.authentication.challengeResponseUsername = ""
-	c.authentication.challengeResponsePassword = ""
-	c.authentication.access.Unlock()
-}
-
-func resolveAuthTokenCredentials(options ClientOptions, configuration TunnelConfiguration, interactiveUsername string) (string, string, bool) {
+func resolveAuthTokenCredentials(options ClientOptions, configuration TunnelConfiguration, stagedUsername string) (string, string, bool) {
 	if configuration.AuthToken == "" {
 		return "", "", false
 	}
@@ -143,7 +115,7 @@ func resolveAuthTokenCredentials(options ClientOptions, configuration TunnelConf
 	}
 	username := options.Authentication.Username
 	if username == "" {
-		username = interactiveUsername
+		username = stagedUsername
 	}
 	if username == "" {
 		return "", "", false
@@ -404,52 +376,45 @@ type CRV1Challenge struct {
 	Echo          bool
 }
 
+// Upstream get_auth_challenge (misc.c) reads
+//
+//	CRV1:<flags>:<state id>:<base64 user>:<challenge text>
+//
+// as colon-delimited fields through buf_parse, which fails only when the
+// message ends before a field begins: the message must reach into the user name
+// field, every field it reaches may be empty, and only the challenge text may
+// be cut off entirely. The flag bag is scanned character by character for `E`
+// and `R`, neither is required, and a user name that does not decode leaves the
+// zero-filled user buffer as it is instead of rejecting the challenge.
 func parseCRV1Challenge(challenge string) (CRV1Challenge, bool) {
-	trimmed := strings.TrimSpace(challenge)
-	if !strings.HasPrefix(trimmed, "CRV1:") {
+	fields := strings.SplitN(challenge, ":", 5)
+	if len(fields) < 4 || fields[0] != "CRV1" {
 		return CRV1Challenge{}, false
 	}
-	fields := strings.SplitN(strings.TrimPrefix(trimmed, "CRV1:"), ":", 4)
-	if len(fields) != 4 {
+	if len(fields) == 4 && fields[3] == "" {
 		return CRV1Challenge{}, false
 	}
-	flagBag := fields[0]
-	stateID := fields[1]
-	encodedUsername := fields[2]
-	challengeText := fields[3]
-	if strings.TrimSpace(stateID) == "" {
-		return CRV1Challenge{}, false
+	challengeText := ""
+	if len(fields) == 5 {
+		challengeText = fields[4]
 	}
-	// Upstream get_auth_challenge requires the `R` flag.
-	if !strings.ContainsRune(flagBag, 'R') {
-		return CRV1Challenge{}, false
-	}
-	decodedUsername, err := base64.StdEncoding.DecodeString(encodedUsername)
-	if err != nil {
-		return CRV1Challenge{}, false
-	}
+	decodedUsername, _ := base64.StdEncoding.DecodeString(fields[3])
 	return CRV1Challenge{
-		StateID:       stateID,
+		StateID:       fields[2],
 		Username:      string(decodedUsername),
 		ChallengeText: challengeText,
-		Echo:          strings.ContainsRune(flagBag, 'E'),
+		Echo:          strings.ContainsRune(fields[1], 'E'),
 	}, true
 }
 
+// Upstream receive_auth_failed (push.c) keeps the challenge only when the text
+// following "AUTH_FAILED," starts with "CRV1:".
 func extractCRV1FromAuthFailed(payload []byte) (CRV1Challenge, bool) {
 	normalized := normalizeControlPayload(payload)
-	if normalized == "" {
-		return CRV1Challenge{}, false
-	}
 	if !strings.HasPrefix(strings.ToUpper(normalized), authFailedPayload+",") {
 		return CRV1Challenge{}, false
 	}
-	remainder := strings.TrimPrefix(normalized, authFailedPayload+",")
-	crv1Index := strings.Index(remainder, "CRV1:")
-	if crv1Index < 0 {
-		return CRV1Challenge{}, false
-	}
-	return parseCRV1Challenge(remainder[crv1Index:])
+	return parseCRV1Challenge(normalized[len(authFailedPayload)+1:])
 }
 
 type AuthChallengeError struct {

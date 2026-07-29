@@ -16,6 +16,7 @@ type observedAuthCredentials struct {
 }
 
 func TestTLSServerInitiatedRenegotiationKeepsDataFlowing(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	credentialEvents := make(chan observedAuthCredentials, 8)
 
@@ -113,7 +114,7 @@ func driveEchoUntilObservedCredentials(
 		}
 		err := tryEchoClientThroughServer(client, server, []byte("drive-reneg"), 2*time.Second)
 		if err != nil {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(interopPollInterval)
 			continue
 		}
 	}

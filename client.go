@@ -37,11 +37,7 @@ type clientAuthenticationSession struct {
 	access                      sync.Mutex
 	updated                     chan struct{}
 	pendingChallenge            *pendingChallengeState
-	interactiveUsername         string
-	interactivePassword         string
-	interactiveSecret           string
-	challengeResponseUsername   string
-	challengeResponsePassword   string
+	staged                      stagedCredentials
 	sentInteractiveCredentials  bool
 	previousAuthenticationError string
 	closed                      bool
@@ -86,14 +82,13 @@ func NewClient(options ClientOptions) (*Client, error) {
 			return nil, E.Extend(ErrOptionNotSupported, "username/password in static mode")
 		}
 	}
-	err = validateCompressionOptions(options.DataChannel.Compression, options.DataChannel.CompressionLZO)
+	compressionSettingsValue, err := resolveCompressionSettings(options.DataChannel.Compression, options.DataChannel.CompressionLZO)
 	if err != nil {
 		return nil, err
 	}
 	allowCompressionPolicyValue, err := resolveEffectiveAllowCompressionPolicy(
 		options.DataChannel.AllowCompression,
-		options.DataChannel.Compression,
-		options.DataChannel.CompressionLZO,
+		compressionSettingsValue,
 	)
 	if err != nil {
 		return nil, err
@@ -134,6 +129,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		},
 		dataPlane: clientDataPlane{
 			allowCompressionPolicy: allowCompressionPolicyValue,
+			compression:            compressionSettingsValue,
 			incomingDataPackets:    newDataPacketQueueWithCapacity[*buf.Buffer](dataPacketQueueCapacity),
 		},
 		authentication: clientAuthenticationSession{
@@ -146,9 +142,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 			},
 		},
 	}
-	client.dataPlane.framing.Store(newDataChannelFraming(options, allowCompressionPolicyValue))
+	client.dataPlane.framing.Store(newDataChannelFraming(compressionSettingsValue, options.DataChannel.Fragment, allowCompressionPolicyValue))
 	client.dataPlane.incomingPacketDropLog.logger = options.Logger
 	client.dataPlane.incomingPacketDropLog.ctx = options.Context
+	client.dataPlane.outgoingPacketDropLog.logger = options.Logger
+	client.dataPlane.outgoingPacketDropLog.ctx = options.Context
 	return client, nil
 }
 

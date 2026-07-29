@@ -4,7 +4,7 @@ import "net/netip"
 
 func (s *tlsServerSession) allocateAndRegisterTunnelAddress() error {
 	parent := s.server.parent
-	if parent.routes == nil || parent.ipPool == nil {
+	if parent.ipPool == nil {
 		return nil
 	}
 	stickyIdentity := ""
@@ -34,50 +34,49 @@ func (s *tlsServerSession) allocateAndRegisterTunnelAddress() error {
 func (s *tlsServerSession) releaseTunnelAddress() {
 	parent := s.server.parent
 	if s.ifconfigInet4.IsValid() {
-		if parent.routes != nil {
-			parent.routes.Unregister(s.ifconfigInet4)
-		}
-		if parent.ipPool != nil {
-			parent.ipPool.Release(s.ifconfigInet4)
-		}
+		parent.routes.Unregister(s.ifconfigInet4)
+		parent.ipPool.Release(s.ifconfigInet4)
 		s.ifconfigInet4 = netip.Addr{}
 		s.ifconfigPeer4 = netip.Addr{}
 	}
 	if s.ifconfigInet6.IsValid() {
-		if parent.routes != nil {
-			parent.routes.Unregister(s.ifconfigInet6)
-		}
-		if parent.ipPool != nil {
-			parent.ipPool.Release(s.ifconfigInet6)
-		}
+		parent.routes.Unregister(s.ifconfigInet6)
+		parent.ipPool.Release(s.ifconfigInet6)
 		s.ifconfigInet6 = netip.Addr{}
 	}
 }
 
-func (s *tlsServerSession) pushLocalAddressIPv4() pushedLocalAddress {
-	parent := s.server.parent
-	if !s.ifconfigInet4.IsValid() || parent.ipPool == nil || !parent.ipPool.HasIPv4() {
-		return pushedLocalAddress{}
-	}
-	prefix := parent.ipPool.IPv4Prefix()
-	topology := parent.ipPool.IPv4Topology()
-	switch topology {
-	case ipv4TopologySubnet:
-		return pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet4, prefix.Bits())}
-	case ipv4TopologyP2P:
-		return pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet4, 32), Peer: s.ifconfigPeer4}
-	case ipv4TopologyNet30:
-		return pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet4, 30), Peer: s.ifconfigPeer4}
-	default:
-		return pushedLocalAddress{}
-	}
+// helper.c expands --server into the pool plus a "topology" push entry, so the
+// topology a peer is addressed under always reaches it together with its
+// ifconfig; an IPv6-only --server-ipv6 pushes no topology at all.
+type serverPushAssignment struct {
+	IPv4Topology     string
+	ServerIPv4       netip.Addr
+	LocalAddressIPv4 pushedLocalAddress
+	LocalAddressIPv6 pushedLocalAddress
+	PeerID           *uint32
 }
 
-func (s *tlsServerSession) pushLocalAddressIPv6() pushedLocalAddress {
-	parent := s.server.parent
-	if !s.ifconfigInet6.IsValid() || parent.ipPool == nil || !parent.ipPool.HasIPv6() {
-		return pushedLocalAddress{}
+func (s *tlsServerSession) pushAssignment() serverPushAssignment {
+	assignment := serverPushAssignment{PeerID: s.currentPeerID()}
+	pool := s.server.parent.ipPool
+	if pool == nil {
+		return assignment
 	}
-	prefix := parent.ipPool.IPv6Prefix()
-	return pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet6, prefix.Bits()), Peer: parent.ipPool.ServerIPv6()}
+	if pool.HasIPv4() && s.ifconfigInet4.IsValid() {
+		assignment.IPv4Topology = pool.IPv4Topology()
+		assignment.ServerIPv4 = pool.ServerIPv4()
+		switch assignment.IPv4Topology {
+		case ipv4TopologySubnet:
+			assignment.LocalAddressIPv4 = pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet4, pool.IPv4Prefix().Bits())}
+		case ipv4TopologyP2P:
+			assignment.LocalAddressIPv4 = pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet4, 32), Peer: s.ifconfigPeer4}
+		case ipv4TopologyNet30:
+			assignment.LocalAddressIPv4 = pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet4, 30), Peer: s.ifconfigPeer4}
+		}
+	}
+	if pool.HasIPv6() && s.ifconfigInet6.IsValid() {
+		assignment.LocalAddressIPv6 = pushedLocalAddress{Prefix: netip.PrefixFrom(s.ifconfigInet6, pool.IPv6Prefix().Bits()), Peer: pool.ServerIPv6()}
+	}
+	return assignment
 }

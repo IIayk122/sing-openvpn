@@ -7,26 +7,23 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
-func calculateMaximumSegmentSize(mssFix uint32, mssFixMode string, dataFraming *dataChannelFraming, codec dataCodec, packetHeaderSize int, outerTransportOverhead int) (uint16, error) {
+func calculateMSSClamp(mssFix uint32, mssFixMode string, dataFraming *dataChannelFraming, codec dataCodec, packetHeaderSize int, outerTransportOverhead int) mssClamp {
 	if mssFix == 0 {
-		return 0, nil
+		return mssClamp{}
 	}
 	if mssFixMode == MSSFixModeFixed {
-		return uint16(min(mssFix-ipv4HeaderMinLength-tcpHeaderMinLength, 1<<16-1)), nil
+		return mssClamp{enabled: true, maximumSegmentSize: uint16(mssFix - ipv4HeaderMinLength - tcpHeaderMinLength)}
 	}
 	if mssFixMode == MSSFixModeMTU {
 		packetHeaderSize += outerTransportOverhead
 	}
-	maximumSegmentSize, err := calculateDataPayloadSize(
+	payloadBudget := calculateDataPayloadBudget(
 		int(mssFix),
 		codec,
 		packetHeaderSize,
 		ipv4HeaderMinLength+tcpHeaderMinLength+dataFraming.payloadOverhead(),
 	)
-	if err != nil {
-		return 0, err
-	}
-	return uint16(min(maximumSegmentSize, 1<<16-1)), nil
+	return mssClamp{enabled: true, maximumSegmentSize: uint16(payloadBudget)}
 }
 
 func openVPNOuterTransportOverhead(protocol string, remoteAddress net.Addr) int {
@@ -38,5 +35,5 @@ func openVPNOuterTransportOverhead(protocol string, remoteAddress net.Addr) int 
 	if strings.HasPrefix(protocol, "tcp") {
 		return ipHeaderSize + tcpHeaderMinLength
 	}
-	return ipHeaderSize + 8
+	return ipHeaderSize + udpHeaderLength
 }

@@ -28,15 +28,15 @@ type crlHandshakeMaterial struct {
 	serverX509           *x509.Certificate
 }
 
-func generateTestRootCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
+func generateTestRootCA(t *testing.T, commonName string) (*x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "openvpn-test-root"},
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: commonName},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
@@ -79,15 +79,14 @@ func generateTestSignedCertificate(t *testing.T, commonName string, caCertificat
 	return parsedCertificate, privateKey
 }
 
-func writeTestCRLSigned(
+func encodeTestCRLSigned(
 	t *testing.T,
-	crlPath string,
 	issuerCertificate *x509.Certificate,
 	signerKey *ecdsa.PrivateKey,
 	revokedCertificates []*x509.Certificate,
 	thisUpdate time.Time,
 	nextUpdate time.Time,
-) {
+) []byte {
 	t.Helper()
 	revokedEntries := make([]x509.RevocationListEntry, 0, len(revokedCertificates))
 	for _, revokedCertificate := range revokedCertificates {
@@ -106,8 +105,21 @@ func writeTestCRLSigned(
 	if err != nil {
 		t.Fatal(err)
 	}
-	pemBuffer := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlBytes})
-	err = os.WriteFile(crlPath, pemBuffer, 0o600)
+	return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: crlBytes})
+}
+
+func writeTestCRLSigned(
+	t *testing.T,
+	crlPath string,
+	issuerCertificate *x509.Certificate,
+	signerKey *ecdsa.PrivateKey,
+	revokedCertificates []*x509.Certificate,
+	thisUpdate time.Time,
+	nextUpdate time.Time,
+) {
+	t.Helper()
+	crlPEM := encodeTestCRLSigned(t, issuerCertificate, signerKey, revokedCertificates, thisUpdate, nextUpdate)
+	err := os.WriteFile(crlPath, crlPEM, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +128,7 @@ func writeTestCRLSigned(
 func writeTestCRLHandshakeMaterial(t *testing.T) crlHandshakeMaterial {
 	t.Helper()
 	temporaryDirectory := t.TempDir()
-	caCertificate, caKey := generateTestRootCA(t)
+	caCertificate, caKey := generateTestRootCA(t, "openvpn-test-root")
 	serverCertificate, serverKey := generateTestSignedCertificate(
 		t, "openvpn-crl-test-server", caCertificate, caKey, x509.ExtKeyUsageServerAuth)
 	clientCertificate, clientKey := generateTestSignedCertificate(
@@ -207,19 +219,8 @@ func assertClientCRLRejectsHandshake(t *testing.T, material crlHandshakeMaterial
 	}
 }
 
-func TestVerifyAgainstCRLAllowsNonRevokedCertificate(t *testing.T) {
-	material := writeTestCRLHandshakeMaterial(t)
-	temporaryDirectory := t.TempDir()
-	crlPath := filepath.Join(temporaryDirectory, "valid.crl.pem")
-	writeTestCRLSigned(
-		t,
-		crlPath,
-		material.caCertificate,
-		material.caKey,
-		nil,
-		time.Now().Add(-time.Minute),
-		time.Now().Add(24*time.Hour),
-	)
+func assertClientCRLAcceptsHandshake(t *testing.T, material crlHandshakeMaterial, crlPath string) {
+	t.Helper()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	authenticatorCalled := make(chan struct{}, 1)
 	server, err := NewServer(ServerOptions{
@@ -284,7 +285,24 @@ func TestVerifyAgainstCRLAllowsNonRevokedCertificate(t *testing.T) {
 	}
 }
 
+func TestVerifyAgainstCRLAllowsNonRevokedCertificate(t *testing.T) {
+	t.Parallel()
+	material := writeTestCRLHandshakeMaterial(t)
+	crlPath := filepath.Join(t.TempDir(), "valid.crl.pem")
+	writeTestCRLSigned(
+		t,
+		crlPath,
+		material.caCertificate,
+		material.caKey,
+		nil,
+		time.Now().Add(-time.Minute),
+		time.Now().Add(24*time.Hour),
+	)
+	assertClientCRLAcceptsHandshake(t, material, crlPath)
+}
+
 func TestVerifyAgainstCRLRejectsRevokedCertificate(t *testing.T) {
+	t.Parallel()
 	material := writeTestCRLHandshakeMaterial(t)
 
 	temporaryDirectory := t.TempDir()
@@ -302,8 +320,9 @@ func TestVerifyAgainstCRLRejectsRevokedCertificate(t *testing.T) {
 }
 
 func TestVerifyAgainstCRLRejectsForgedSignature(t *testing.T) {
+	t.Parallel()
 	material := writeTestCRLHandshakeMaterial(t)
-	_, rogueKey := generateTestRootCA(t)
+	_, rogueKey := generateTestRootCA(t, "openvpn-test-rogue-root")
 
 	temporaryDirectory := t.TempDir()
 	crlPath := filepath.Join(temporaryDirectory, "forged.crl.pem")
@@ -320,6 +339,7 @@ func TestVerifyAgainstCRLRejectsForgedSignature(t *testing.T) {
 }
 
 func TestVerifyAgainstCRLRejectsExpiredCRL(t *testing.T) {
+	t.Parallel()
 	material := writeTestCRLHandshakeMaterial(t)
 
 	temporaryDirectory := t.TempDir()
@@ -337,6 +357,7 @@ func TestVerifyAgainstCRLRejectsExpiredCRL(t *testing.T) {
 }
 
 func TestVerifyAgainstCRLRejectsCRLBeforeThisUpdate(t *testing.T) {
+	t.Parallel()
 	material := writeTestCRLHandshakeMaterial(t)
 
 	temporaryDirectory := t.TempDir()
@@ -351,4 +372,77 @@ func TestVerifyAgainstCRLRejectsCRLBeforeThisUpdate(t *testing.T) {
 		time.Now().Add(24*time.Hour),
 	)
 	assertClientCRLRejectsHandshake(t, material, crlPath)
+}
+
+type crlBundleHandshakeMaterial struct {
+	handshake          crlHandshakeMaterial
+	firstAuthority     *x509.Certificate
+	firstAuthorityKey  *ecdsa.PrivateKey
+	secondAuthority    *x509.Certificate
+	secondAuthorityKey *ecdsa.PrivateKey
+}
+
+// The peer being verified is issued by the first authority and the local
+// certificate by the second, so both authorities of the --ca bundle are in use
+// and only one of the two CRLs covers the verified chain.
+func writeTestCRLBundleHandshakeMaterial(t *testing.T) crlBundleHandshakeMaterial {
+	t.Helper()
+	temporaryDirectory := t.TempDir()
+	firstAuthority, firstAuthorityKey := generateTestRootCA(t, "openvpn-crl-bundle-first-root")
+	secondAuthority, secondAuthorityKey := generateTestRootCA(t, "openvpn-crl-bundle-second-root")
+	serverCertificate, serverKey := generateTestSignedCertificate(
+		t, "openvpn-crl-bundle-server", firstAuthority, firstAuthorityKey, x509.ExtKeyUsageServerAuth)
+	clientCertificate, clientKey := generateTestSignedCertificate(
+		t, "openvpn-crl-bundle-client", secondAuthority, secondAuthorityKey, x509.ExtKeyUsageClientAuth)
+	certificateAuthorityPath := writeTestPEMBundle(t, filepath.Join(temporaryDirectory, "ca-bundle.crt"),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: firstAuthority.Raw}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: secondAuthority.Raw}),
+	)
+	return crlBundleHandshakeMaterial{
+		handshake: crlHandshakeMaterial{
+			certificateAuthority: Material{Path: certificateAuthorityPath},
+			serverCertificate:    Material{Path: writeTestPEM(t, temporaryDirectory, "server.crt", "CERTIFICATE", serverCertificate.Raw)},
+			serverKey:            Material{Path: writeTestPKCS8Key(t, temporaryDirectory, "server.key", serverKey)},
+			clientCertificate:    Material{Path: writeTestPEM(t, temporaryDirectory, "client.crt", "CERTIFICATE", clientCertificate.Raw)},
+			clientKey:            Material{Path: writeTestPKCS8Key(t, temporaryDirectory, "client.key", clientKey)},
+			caCertificate:        firstAuthority,
+			caKey:                firstAuthorityKey,
+			serverX509:           serverCertificate,
+		},
+		firstAuthority:     firstAuthority,
+		firstAuthorityKey:  firstAuthorityKey,
+		secondAuthority:    secondAuthority,
+		secondAuthorityKey: secondAuthorityKey,
+	}
+}
+
+func TestVerifyAgainstCRLBundleAppliesTheEntryIssuedByThePeerAuthority(t *testing.T) {
+	t.Parallel()
+	material := writeTestCRLBundleHandshakeMaterial(t)
+	thisUpdate := time.Now().Add(-time.Minute)
+	nextUpdate := time.Now().Add(24 * time.Hour)
+	peerAuthorityEntry := encodeTestCRLSigned(
+		t, material.firstAuthority, material.firstAuthorityKey, nil, thisUpdate, nextUpdate)
+	peerAuthorityRevokingEntry := encodeTestCRLSigned(
+		t, material.firstAuthority, material.firstAuthorityKey,
+		[]*x509.Certificate{material.handshake.serverX509}, thisUpdate, nextUpdate)
+	otherAuthorityEntry := encodeTestCRLSigned(
+		t, material.secondAuthority, material.secondAuthorityKey, nil, thisUpdate, nextUpdate)
+
+	t.Run("accepts_peer_while_a_foreign_entry_leads_the_bundle", func(t *testing.T) {
+		crlPath := writeTestPEMBundle(t, filepath.Join(t.TempDir(), "crl-bundle.pem"), otherAuthorityEntry, peerAuthorityEntry)
+		assertClientCRLAcceptsHandshake(t, material.handshake, crlPath)
+	})
+	t.Run("rejects_peer_revoked_by_the_leading_entry", func(t *testing.T) {
+		crlPath := writeTestPEMBundle(t, filepath.Join(t.TempDir(), "crl-bundle.pem"), peerAuthorityRevokingEntry, otherAuthorityEntry)
+		assertClientCRLRejectsHandshake(t, material.handshake, crlPath)
+	})
+	t.Run("rejects_peer_revoked_by_the_trailing_entry", func(t *testing.T) {
+		crlPath := writeTestPEMBundle(t, filepath.Join(t.TempDir(), "crl-bundle.pem"), otherAuthorityEntry, peerAuthorityRevokingEntry)
+		assertClientCRLRejectsHandshake(t, material.handshake, crlPath)
+	})
+	t.Run("rejects_peer_whose_authority_has_no_entry", func(t *testing.T) {
+		crlPath := writeTestPEMBundle(t, filepath.Join(t.TempDir(), "crl-bundle.pem"), otherAuthorityEntry)
+		assertClientCRLRejectsHandshake(t, material.handshake, crlPath)
+	})
 }

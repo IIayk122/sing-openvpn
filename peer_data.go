@@ -7,12 +7,14 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-openvpn/proto"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type tlsPeerHooks struct {
-	outgoingDataPayloads     func(payloads [][]byte, codec dataCodec, packetHeaderSize int) ([][][]byte, error)
-	outgoingDataBuffers      func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) ([][]*buf.Buffer, error)
+	outgoingDataPayloads     func(payloads [][]byte, codec dataCodec, packetHeaderSize int) [][][]byte
+	outgoingDataBuffers      func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) [][]*buf.Buffer
 	decodeIncomingFraming    func(payload *buf.Buffer) (*buf.Buffer, bool, error)
 	deliverIncomingPayloads  func(payloads [][]byte, codec dataCodec, packetHeaderSize int)
 	deliverIncomingBuffers   func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int)
@@ -129,6 +131,22 @@ func (s *tlsPeerSession) handleIncomingDataPackets(packets []*proto.Packet) {
 			if s.hooks.logDroppedIncomingPacket != nil {
 				s.hooks.logDroppedIncomingPacket(err)
 			}
+			// Upstream process_incoming_link_part1 (forward.c) registers SIGUSR1
+			// with "Fatal decryption error (process_incoming_link), restarting"
+			// whenever openvpn_decrypt fails while
+			// link_socket_connection_oriented holds, and the event loop takes
+			// that signal before the next packet of the stream reaches it: the
+			// client restarts the connection, and multi_process_post closes the
+			// server instance together with its socket.  Only the data channel
+			// decrypt reaches that test — tls_pre_decrypt empties the buffer
+			// both for a control packet and for a data packet whose key id
+			// matches no key_state, and openvpn_decrypt reports success for an
+			// empty buffer.
+			if s.packetConnection.ConnectionOriented() {
+				flushDecodedPayloads()
+				go s.hooks.sessionTerminated(E.Extend(ErrFatalDecryption, err.Error()))
+				return
+			}
 			continue
 		}
 		if readUsageObserver != nil {
@@ -160,6 +178,13 @@ func (s *tlsPeerSession) handleIncomingDataPackets(packets []*proto.Packet) {
 				continue
 			}
 		}
+		// process_incoming_link_part2 tests is_ping_msg, is_occ_msg and the tun
+		// write under a single len > 0 guard, so an empty payload reaches
+		// neither the tunnel nor the occ handlers.
+		if decodedPayload.IsEmpty() {
+			decodedPayload.Release()
+			continue
+		}
 		if bytes.Equal(decodedPayload.Bytes(), openVPNDataChannelPingPayload) {
 			flushDecodedPayloads()
 			decodedPayload.Release()
@@ -175,7 +200,10 @@ func (s *tlsPeerSession) handleIncomingDataPackets(packets []*proto.Packet) {
 			flushDecodedPayloads()
 			response, shouldSend := buildOCCResponseForIncoming(decodedPayload.Bytes(), s.localOptionsString)
 			if shouldSend {
-				_ = s.WriteDataPacket(response)
+				messages := s.dataChannelMessages()
+				if messages != nil {
+					messages.sendOCCMessage(response)
+				}
 			}
 			decodedPayload.Release()
 			continue
@@ -355,15 +383,35 @@ func (s *tlsPeerSession) WriteDataPacketBuffers(payloads []*buf.Buffer) error {
 	return s.writeDataPacketBuffersLocked(payloads)
 }
 
-func (s *tlsPeerSession) tryWriteDataPacket(payload []byte) error {
-	if !s.dataWriteAccess.TryLock() {
-		return ErrDataChannelNotReady
+// Upstream process_explicit_exit_notification_timer_wakeup (forward.c) only
+// stamps occ_op on the instance's single outgoing slot and process_outgoing_link
+// carries it whenever the link takes it, so an attempt still queued when the
+// next tick arrives is left to that tick.  The link write it queues behind
+// belongs to another writer and carries no deadline of this one.
+func (s *tlsPeerSession) writeDataPacketWithinTick(payload []byte, tick time.Duration) {
+	attempt := make(chan struct{})
+	go func() {
+		defer close(attempt)
+		_ = s.WriteDataPacket(payload)
+	}()
+	timer := time.NewTimer(tick)
+	defer timer.Stop()
+	select {
+	case <-attempt:
+	case <-timer.C:
 	}
-	defer s.dataWriteAccess.Unlock()
-	return s.writeDataPacketsLocked([][]byte{payload})
 }
 
+// process_incoming_tun (forward.c) reaches encrypt_sign only for a tun buffer
+// with len > 0, so an empty payload never becomes a wire packet and never
+// consumes an outgoing packet id.
 func (s *tlsPeerSession) writeDataPacketsLocked(payloads [][]byte) error {
+	payloads = common.Filter(payloads, func(payload []byte) bool {
+		return len(payload) > 0
+	})
+	if len(payloads) == 0 {
+		return nil
+	}
 	sendCodec, currentKeyID, sendSessionManager := s.currentSendKeyState()
 	if sendCodec == nil {
 		return ErrDataChannelNotReady
@@ -388,10 +436,13 @@ func (s *tlsPeerSession) writeDataPacketsLocked(payloads [][]byte) error {
 			byte(encodedPeerID),
 		}
 	}
-	preparedPayloads, preparationErr := s.hooks.outgoingDataPayloads(payloads, sendCodec, packetHeaderSize)
+	preparedPayloads := s.hooks.outgoingDataPayloads(payloads, sendCodec, packetHeaderSize)
 	preparedPacketCount := 0
 	for _, outgoingPayloads := range preparedPayloads {
 		preparedPacketCount += len(outgoingPayloads)
+	}
+	if preparedPacketCount == 0 {
+		return nil
 	}
 	dataPacketIDs, err := sendSessionManager.NewDataPacketIDs(outgoingOpcode, preparedPacketCount)
 	if err != nil {
@@ -441,9 +492,6 @@ func (s *tlsPeerSession) writeDataPacketsLocked(payloads [][]byte) error {
 		}
 		completedPayloads++
 	}
-	if encodeErr == nil {
-		encodeErr = preparationErr
-	}
 	rawPackets := make([][]byte, len(encodedPackets))
 	for i, encodedPacket := range encodedPackets {
 		rawPackets[i] = encodedPacket.rawPayload
@@ -456,6 +504,9 @@ func (s *tlsPeerSession) writeDataPacketsLocked(payloads [][]byte) error {
 	}
 	writtenPackets, writeErr := s.packetConnection.WritePackets(rawPackets)
 	for i, payload := range payloads[:completedPayloads] {
+		if lastEncodedPacket[i] < 0 {
+			continue
+		}
 		if lastEncodedPacket[i] >= writtenPackets {
 			break
 		}
@@ -480,6 +531,18 @@ type tlsOutgoingDataBuffer struct {
 }
 
 func (s *tlsPeerSession) writeDataPacketBuffersLocked(payloads []*buf.Buffer) error {
+	retainedPayloads := payloads[:0]
+	for _, payload := range payloads {
+		if payload.IsEmpty() {
+			payload.Release()
+			continue
+		}
+		retainedPayloads = append(retainedPayloads, payload)
+	}
+	payloads = retainedPayloads
+	if len(payloads) == 0 {
+		return nil
+	}
 	payloadLengths := make([]int, len(payloads))
 	payloadPings := make([]bool, len(payloads))
 	for i, payload := range payloads {
@@ -511,13 +574,13 @@ func (s *tlsPeerSession) writeDataPacketBuffersLocked(payloads []*buf.Buffer) er
 			byte(encodedPeerID),
 		}
 	}
-	preparedPayloads, err := s.hooks.outgoingDataBuffers(payloads, sendCodec, packetHeaderSize)
-	if err != nil {
-		return err
-	}
+	preparedPayloads := s.hooks.outgoingDataBuffers(payloads, sendCodec, packetHeaderSize)
 	preparedPacketCount := 0
 	for _, outgoingPayloads := range preparedPayloads {
 		preparedPacketCount += len(outgoingPayloads)
+	}
+	if preparedPacketCount == 0 {
+		return nil
 	}
 	dataPacketIDs, err := sendSessionManager.NewDataPacketIDs(outgoingOpcode, preparedPacketCount)
 	if err != nil {
@@ -582,6 +645,9 @@ func (s *tlsPeerSession) writeDataPacketBuffersLocked(payloads []*buf.Buffer) er
 	}
 	writtenPackets, writeErr := s.packetConnection.WritePacketBuffers(packetBuffers)
 	for i := range payloads {
+		if lastEncodedPacket[i] < 0 {
+			continue
+		}
 		if lastEncodedPacket[i] >= writtenPackets {
 			break
 		}

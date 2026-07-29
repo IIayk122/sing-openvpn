@@ -12,6 +12,7 @@ import (
 )
 
 func TestTLSClientInitiatedRenegotiationKeepsDataFlowing(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	credentialEvents := make(chan observedAuthCredentials, 8)
 

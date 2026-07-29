@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
 	"encoding/pem"
@@ -26,7 +27,7 @@ import (
 
 type peerCertificateVerifierOptions struct {
 	Roots                    *certificatePool
-	KeyUsage                 x509.ExtKeyUsage
+	Purpose                  certificatePurpose
 	VerifyName               string
 	VerifyNameType           string
 	PeerFingerprints         []string
@@ -54,78 +55,86 @@ func (v *peerCertificateVerifier) Verify(rawCertificates [][]byte) error {
 		}
 		peerCertificates = append(peerCertificates, peerCertificate)
 	}
-	// Upstream options_postprocess_verify / tls_ctx_load_ca skip chain
-	// verification when --peer-fingerprint is used without --ca.
-	fingerprintOnly := v.options.Roots == nil && len(v.options.PeerFingerprints) > 0
+	// Upstream loads no trust store when --peer-fingerprint replaces --ca, and
+	// verify_callback then answers every X509_verify_cert error with success:
+	// issuer lookup, chain signatures, each validity window, the store purpose,
+	// the security level --tls-cert-profile sets and the revocation state all
+	// stop being enforced, leaving only what verify_cert reads off the peer
+	// certificate itself.
+	if v.options.Roots == nil && len(v.options.PeerFingerprints) > 0 {
+		return v.verifyPeerCertificate(peerCertificates[0])
+	}
+	verifiedChain, err := v.verifyCertificateChain(rawCertificates, peerCertificates)
+	if err != nil {
+		return err
+	}
+	err = enforceCertificateProfile(verifiedChain, v.options.CertificateProfile)
+	if err != nil {
+		return err
+	}
+	err = v.verifyPeerCertificate(peerCertificates[0])
+	if err != nil {
+		return err
+	}
+	return verifyAgainstCRL(verifiedChain, v.options.CRLPath)
+}
+
+func (v *peerCertificateVerifier) verifyCertificateChain(rawCertificates [][]byte, peerCertificates []*x509.Certificate) ([]*x509.Certificate, error) {
 	var verifiedChains [][]*x509.Certificate
-	if fingerprintOnly {
-		now := time.Now()
-		if now.Before(peerCertificates[0].NotBefore) {
-			return E.New("peer certificate not yet valid")
+	var err error
+	switch v.options.CertificateProfile {
+	case "insecure":
+		verifiedChains, err = verifyInsecureCertificateChain(rawCertificates, v.options.Roots)
+	case "legacy":
+		verifiedChains, err = verifyLegacyCertificateChain(rawCertificates, v.options.Roots)
+	default:
+		intermediates := x509.NewCertPool()
+		for _, peerCertificate := range peerCertificates[1:] {
+			intermediates.AddCert(peerCertificate)
 		}
-		if now.After(peerCertificates[0].NotAfter) {
-			return E.New("peer certificate has expired")
+		verifyOptions := x509.VerifyOptions{
+			Roots:         v.options.Roots.standard,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 		}
-		// Upstream verify_cert still applies profile and usage checks.
-		verifiedChains = [][]*x509.Certificate{{peerCertificates[0]}}
-	} else {
-		var err error
-		switch v.options.CertificateProfile {
-		case "insecure":
-			verifiedChains, err = verifyInsecureCertificateChain(rawCertificates, v.options.Roots, v.options.KeyUsage)
-		case "legacy":
-			verifiedChains, err = verifyLegacyCertificateChain(rawCertificates, v.options.Roots, v.options.KeyUsage)
-		default:
-			intermediates := x509.NewCertPool()
-			for _, peerCertificate := range peerCertificates[1:] {
-				intermediates.AddCert(peerCertificate)
-			}
-			verifyOptions := x509.VerifyOptions{
-				Roots:         v.options.Roots.standard,
-				Intermediates: intermediates,
-				KeyUsages:     []x509.ExtKeyUsage{v.options.KeyUsage},
-			}
-			verifiedChains, err = peerCertificates[0].Verify(verifyOptions)
-		}
-		if err != nil {
-			return err
-		}
+		verifiedChains, err = peerCertificates[0].Verify(verifyOptions)
 	}
-	err := enforceCertificateProfile(verifiedChains, v.options.CertificateProfile)
+	if err != nil {
+		return nil, err
+	}
+	verifiedChains, err = filterChainsByCertificatePurpose(verifiedChains, v.options.Purpose)
+	if err != nil {
+		return nil, err
+	}
+	return verifiedChains[0], nil
+}
+
+// Upstream verify_cert derives these from the peer certificate alone, outside
+// the chain verification that --peer-fingerprint without --ca disables.
+func (v *peerCertificateVerifier) verifyPeerCertificate(peerCertificate *x509.Certificate) error {
+	err := verifyX509NameMatch(peerCertificate, v.options.VerifyName, v.options.VerifyNameType)
 	if err != nil {
 		return err
 	}
-	err = verifyX509NameMatch(peerCertificates[0], v.options.VerifyName, v.options.VerifyNameType)
+	err = verifyPeerFingerprint(peerCertificate, v.options.PeerFingerprints)
 	if err != nil {
 		return err
 	}
-	err = verifyPeerFingerprint(verifiedChains, v.options.PeerFingerprints)
-	if err != nil {
-		return err
-	}
-	err = verifyRequiredKeyUsage(peerCertificates[0], v.options.RequiredKeyUsage)
+	err = verifyRequiredKeyUsage(peerCertificate, v.options.RequiredKeyUsage)
 	if err != nil {
 		return err
 	}
 	if v.options.RequireKeyUsageExtension {
-		err = verifyKeyUsageExtensionPresent(peerCertificates[0])
+		err = verifyKeyUsageExtensionPresent(peerCertificate)
 		if err != nil {
 			return err
 		}
 	}
-	err = verifyRequiredExtendedKeyUsage(peerCertificates[0], v.options.RequiredExtendedUsage)
+	err = verifyRequiredExtendedKeyUsage(peerCertificate, v.options.RequiredExtendedUsage)
 	if err != nil {
 		return err
 	}
-	err = verifyNSCertType(peerCertificates[0], v.options.NSCertificateType)
-	if err != nil {
-		return err
-	}
-	err = verifyAgainstCRL(verifiedChains, v.options.CRLPath)
-	if err != nil {
-		return err
-	}
-	return nil
+	return verifyNSCertType(peerCertificate, v.options.NSCertificateType)
 }
 
 var insecureCertificateValidationKey struct {
@@ -134,7 +143,7 @@ var insecureCertificateValidationKey struct {
 	err  error
 }
 
-func verifyInsecureCertificateChain(rawCertificates [][]byte, roots *certificatePool, keyUsage x509.ExtKeyUsage) ([][]*x509.Certificate, error) {
+func verifyInsecureCertificateChain(rawCertificates [][]byte, roots *certificatePool) ([][]*x509.Certificate, error) {
 	peerCertificates := make([]*x509.Certificate, 0, len(rawCertificates))
 	for _, rawCertificate := range rawCertificates {
 		peerCertificate, err := x509.ParseCertificate(rawCertificate)
@@ -189,7 +198,7 @@ func verifyInsecureCertificateChain(rawCertificates [][]byte, roots *certificate
 	syntheticChains, err := syntheticPeerCertificates[0].Verify(x509.VerifyOptions{
 		Roots:         syntheticRoots,
 		Intermediates: syntheticIntermediates,
-		KeyUsages:     []x509.ExtKeyUsage{keyUsage},
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	})
 	if err != nil {
 		return nil, err
@@ -243,14 +252,11 @@ func verifyInsecureCertificateSignature(certificate *x509.Certificate, parent *x
 	return legacyCertificate.CheckSignatureFrom(legacyParent)
 }
 
-func enforceCertificateProfile(verifiedChains [][]*x509.Certificate, profile string) error {
-	if len(verifiedChains) == 0 {
-		return nil
-	}
+func enforceCertificateProfile(verifiedChain []*x509.Certificate, profile string) error {
 	if profile == "" {
 		profile = "legacy"
 	}
-	for _, chainCertificate := range verifiedChains[0] {
+	for _, chainCertificate := range verifiedChain {
 		err := enforceCertificateProfilePublicKey(chainCertificate, profile)
 		if err != nil {
 			return err
@@ -313,7 +319,7 @@ func enforceCertificateProfileSignatureAlgorithm(peerCertificate *x509.Certifica
 	return nil
 }
 
-func verifyLegacyCertificateChain(rawCertificates [][]byte, roots *certificatePool, keyUsage x509.ExtKeyUsage) ([][]*x509.Certificate, error) {
+func verifyLegacyCertificateChain(rawCertificates [][]byte, roots *certificatePool) ([][]*x509.Certificate, error) {
 	peerCertificate, err := ctx509.ParseCertificate(rawCertificates[0])
 	if err != nil {
 		return nil, err
@@ -329,7 +335,7 @@ func verifyLegacyCertificateChain(rawCertificates [][]byte, roots *certificatePo
 	verifyOptions := ctx509.VerifyOptions{
 		Roots:         roots.legacy,
 		Intermediates: intermediates,
-		KeyUsages:     []ctx509.ExtKeyUsage{legacyExtKeyUsage(keyUsage)},
+		KeyUsages:     []ctx509.ExtKeyUsage{ctx509.ExtKeyUsageAny},
 	}
 	legacyChains, err := peerCertificate.Verify(verifyOptions)
 	if err != nil {
@@ -350,15 +356,42 @@ func verifyLegacyCertificateChain(rawCertificates [][]byte, roots *certificatePo
 	return verifiedChains, nil
 }
 
-func legacyExtKeyUsage(keyUsage x509.ExtKeyUsage) ctx509.ExtKeyUsage {
-	switch keyUsage {
-	case x509.ExtKeyUsageServerAuth:
-		return ctx509.ExtKeyUsageServerAuth
-	case x509.ExtKeyUsageClientAuth:
-		return ctx509.ExtKeyUsageClientAuth
-	default:
-		return ctx509.ExtKeyUsageAny
+// Upstream verify_peer_cert (ssl_verify.c) matches --verify-x509-name subject
+// against the rendered subject, and name / name-prefix against the username
+// taken from the --x509-username-field attribute.
+func verifyX509NameMatch(peerCertificate *x509.Certificate, expectedName string, verifyType string) error {
+	if expectedName == "" || peerCertificate == nil {
+		return nil
 	}
+	switch verifyType {
+	case "", "subject":
+		subject, err := formatCertificateSubject(peerCertificate.RawSubject)
+		if err != nil {
+			return err
+		}
+		if subject != expectedName {
+			return ErrPeerCertificateName
+		}
+	case "name":
+		username, err := certificateUsername(peerCertificate.RawSubject, commonNameAttributeOID)
+		if err != nil {
+			return err
+		}
+		if username != expectedName {
+			return ErrPeerCertificateName
+		}
+	case "name-prefix":
+		username, err := certificateUsername(peerCertificate.RawSubject, commonNameAttributeOID)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(username, expectedName) {
+			return ErrPeerCertificateName
+		}
+	default:
+		return E.New("unknown X.509 name type: ", verifyType)
+	}
+	return nil
 }
 
 // Upstream x509_verify_cert_ku compares --remote-cert-ku against the
@@ -411,72 +444,50 @@ func reconstructOpenSSLKeyUsage(peerCertificate *x509.Certificate) (uint, bool, 
 // Upstream x509_verify_cert_ku treats OPENVPN_KU_REQUIRED as "extension
 // present, bits checked by TLS library".
 func verifyKeyUsageExtensionPresent(peerCertificate *x509.Certificate) error {
-	for _, extension := range peerCertificate.Extensions {
-		if extension.Id.Equal(keyUsageExtensionOID) {
-			return nil
-		}
+	if !certificateHasKeyUsageExtension(peerCertificate) {
+		return ErrPeerCertificateKeyUsage
 	}
-	return ErrPeerCertificateKeyUsage
+	return nil
+}
+
+func certificateHasKeyUsageExtension(certificate *x509.Certificate) bool {
+	return slices.ContainsFunc(certificate.Extensions, func(extension pkix.Extension) bool {
+		return extension.Id.Equal(keyUsageExtensionOID)
+	})
 }
 
 var keyUsageExtensionOID = asn1.ObjectIdentifier{2, 5, 29, 15}
 
-// Upstream x509_verify_ns_cert_type still accepts Netscape Cert Type as
-// a fallback to EKU.
 var netscapeCertTypeExtensionOID = asn1.ObjectIdentifier{2, 16, 840, 1, 113730, 1, 1}
 
-// Upstream x509_verify_ns_cert_type reads NS_SSL_CLIENT / NS_SSL_SERVER MSB-first.
+// OpenSSL NS_SSL_CLIENT / NS_SSL_SERVER, read MSB-first.
 const (
 	netscapeCertTypeSSLClient = 0x80
 	netscapeCertTypeSSLServer = 0x40
 )
 
-// Upstream x509_verify_ns_cert_type accepts either EKU or Netscape Cert Type.
+// Upstream x509_verify_ns_cert_type delegates --ns-cert-type to
+// X509_check_purpose with X509_PURPOSE_SSL_CLIENT / X509_PURPOSE_SSL_SERVER.
 func verifyNSCertType(peerCertificate *x509.Certificate, requirement string) error {
-	if requirement == "" {
-		return nil
-	}
-	var expectedEKU x509.ExtKeyUsage
-	var expectedNetscapeBit byte
+	var purpose certificatePurpose
 	switch requirement {
+	case "":
+		return nil
 	case "server":
-		expectedEKU = x509.ExtKeyUsageServerAuth
-		expectedNetscapeBit = netscapeCertTypeSSLServer
+		purpose = certificatePurposeSSLServer
 	case "client":
-		expectedEKU = x509.ExtKeyUsageClientAuth
-		expectedNetscapeBit = netscapeCertTypeSSLClient
+		purpose = certificatePurposeSSLClient
 	default:
 		return E.New("ns-cert-type must be 'server' or 'client', got: ", requirement)
 	}
-	if slices.Contains(peerCertificate.ExtKeyUsage, expectedEKU) {
-		return nil
-	}
-	hasLegacyMatch, err := checkNetscapeCertTypeBit(peerCertificate, expectedNetscapeBit)
+	matched, err := checkCertificatePurpose(peerCertificate, purpose, false)
 	if err != nil {
 		return err
 	}
-	if hasLegacyMatch {
-		return nil
+	if !matched {
+		return ErrPeerCertificateNSCertType
 	}
-	return ErrPeerCertificateNSCertType
-}
-
-func checkNetscapeCertTypeBit(peerCertificate *x509.Certificate, expectedBit byte) (bool, error) {
-	for _, extension := range peerCertificate.Extensions {
-		if !extension.Id.Equal(netscapeCertTypeExtensionOID) {
-			continue
-		}
-		var bitString asn1.BitString
-		_, err := asn1.Unmarshal(extension.Value, &bitString)
-		if err != nil {
-			return false, err
-		}
-		if len(bitString.Bytes) == 0 {
-			return false, nil
-		}
-		return bitString.Bytes[0]&expectedBit == expectedBit, nil
-	}
-	return false, nil
+	return nil
 }
 
 func verifyRequiredExtendedKeyUsage(peerCertificate *x509.Certificate, requiredExtendedUsage []asn1.ObjectIdentifier) error {
@@ -510,50 +521,99 @@ func readCertificateExtendedKeyUsage(peerCertificate *x509.Certificate) ([]asn1.
 	return nil, nil
 }
 
-// Upstream tls_ctx_reload_crl applies OpenSSL CRL_CHECK | CRL_CHECK_ALL.
-func verifyAgainstCRL(verifiedChains [][]*x509.Certificate, crlPath string) error {
+// Upstream tls_ctx_reload_crl loads every CRL in the --crl-verify file into
+// the store and sets CRL_CHECK | CRL_CHECK_ALL, so OpenSSL check_revocation
+// runs check_cert at every chain depth including the trust anchor.
+func verifyAgainstCRL(chain []*x509.Certificate, crlPath string) error {
 	if crlPath == "" {
 		return nil
 	}
-	revocationList, err := loadRevocationList(crlPath)
+	revocationLists, err := loadRevocationLists(crlPath)
 	if err != nil {
 		return err
 	}
-	if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
-		return ErrCRLSignatureInvalid
-	}
-	chain := verifiedChains[0]
-	signer := findCRLSignerInChain(chain, revocationList.RawIssuer)
-	if signer == nil {
-		return ErrCRLSignatureInvalid
-	}
-	signatureErr := revocationList.CheckSignatureFrom(signer)
-	if signatureErr != nil {
-		return ErrCRLSignatureInvalid
+	if len(chain) == 0 {
+		return ErrCRLUnavailable
 	}
 	now := time.Now()
+	for depth := range chain {
+		err = checkChainDepthAgainstCRL(chain, depth, revocationLists, now)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Upstream OpenSSL check_cert scores every CRL issued by the certificate's
+// issuer, prefers one inside its validity window, and only then runs check_crl
+// and cert_crl on the winner; a depth with no scoring CRL is
+// X509_V_ERR_UNABLE_TO_GET_CRL.
+func checkChainDepthAgainstCRL(chain []*x509.Certificate, depth int, revocationLists []*x509.RevocationList, now time.Time) error {
+	certificate := chain[depth]
+	issuerDepth := depth
+	if depth < len(chain)-1 {
+		issuerDepth = depth + 1
+	}
+	var selectedList *x509.RevocationList
+	var selectedSigner *x509.Certificate
+	var selectedWithinValidity bool
+	for _, revocationList := range revocationLists {
+		if !bytes.Equal(revocationList.RawIssuer, certificate.RawIssuer) {
+			continue
+		}
+		signer := findCRLSignerInChain(chain[issuerDepth:], revocationList.RawIssuer)
+		if signer == nil {
+			continue
+		}
+		withinValidity := revocationListValidityError(revocationList, now) == nil
+		outscoresSelected := selectedList == nil || withinValidity && !selectedWithinValidity
+		if !outscoresSelected {
+			continue
+		}
+		selectedList = revocationList
+		selectedSigner = signer
+		selectedWithinValidity = withinValidity
+	}
+	if selectedList == nil {
+		return ErrCRLUnavailable
+	}
+	if certificateHasKeyUsageExtension(selectedSigner) && selectedSigner.KeyUsage&x509.KeyUsageCRLSign == 0 {
+		return ErrCRLIssuerKeyUsage
+	}
+	err := revocationListValidityError(selectedList, now)
+	if err != nil {
+		return err
+	}
+	err = selectedList.CheckSignatureFrom(selectedSigner)
+	if err != nil {
+		return ErrCRLSignatureInvalid
+	}
+	for _, revokedEntry := range selectedList.RevokedCertificateEntries {
+		if revokedEntry.SerialNumber == nil || certificate.SerialNumber == nil {
+			continue
+		}
+		if revokedEntry.SerialNumber.Cmp(certificate.SerialNumber) == 0 {
+			return ErrPeerCertificateRevoked
+		}
+	}
+	return nil
+}
+
+// Upstream OpenSSL check_crl_time rejects a CRL whose lastUpdate is in the
+// future or whose nextUpdate has passed.
+func revocationListValidityError(revocationList *x509.RevocationList, now time.Time) error {
 	if now.Before(revocationList.ThisUpdate) {
 		return ErrCRLExpired
 	}
 	if !revocationList.NextUpdate.IsZero() && now.After(revocationList.NextUpdate) {
 		return ErrCRLExpired
 	}
-	for _, chainMember := range chain {
-		if !bytes.Equal(chainMember.RawIssuer, revocationList.RawIssuer) {
-			continue
-		}
-		for _, revokedEntry := range revocationList.RevokedCertificateEntries {
-			if revokedEntry.SerialNumber == nil || chainMember.SerialNumber == nil {
-				continue
-			}
-			if revokedEntry.SerialNumber.Cmp(chainMember.SerialNumber) == 0 {
-				return ErrPeerCertificateRevoked
-			}
-		}
-	}
 	return nil
 }
 
+// Upstream OpenSSL check_crl resolves the CRL issuer at the next chain depth
+// and, failing that, anywhere above it in the chain.
 func findCRLSignerInChain(chain []*x509.Certificate, rawIssuer []byte) *x509.Certificate {
 	for _, candidate := range chain {
 		if bytes.Equal(candidate.RawSubject, rawIssuer) {
@@ -563,15 +623,38 @@ func findCRLSignerInChain(chain []*x509.Certificate, rawIssuer []byte) *x509.Cer
 	return nil
 }
 
-func loadRevocationList(crlPath string) (*x509.RevocationList, error) {
+// Upstream tls_ctx_reload_crl reads PEM CRL blocks in a loop until the buffer
+// is exhausted, so a --crl-verify file holds one CRL per issuing CA.
+func loadRevocationLists(crlPath string) ([]*x509.RevocationList, error) {
 	crlBytes, err := os.ReadFile(crlPath)
 	if err != nil {
 		return nil, err
 	}
-	if pemBlock, _ := pem.Decode(crlBytes); pemBlock != nil {
-		crlBytes = pemBlock.Bytes
+	var revocationLists []*x509.RevocationList
+	remaining := crlBytes
+	for len(remaining) > 0 {
+		pemBlock, rest := pem.Decode(remaining)
+		if pemBlock == nil {
+			break
+		}
+		remaining = rest
+		if pemBlock.Type != "X509 CRL" && pemBlock.Type != "CRL" {
+			continue
+		}
+		revocationList, parseErr := x509.ParseRevocationList(pemBlock.Bytes)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		revocationLists = append(revocationLists, revocationList)
 	}
-	return x509.ParseRevocationList(crlBytes)
+	if len(revocationLists) == 0 {
+		revocationList, parseErr := x509.ParseRevocationList(crlBytes)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		revocationLists = append(revocationLists, revocationList)
+	}
+	return revocationLists, nil
 }
 
 func parseRemoteCertKeyUsages(values []string) ([]uint, error) {
@@ -651,19 +734,6 @@ func mergeExtendedKeyUsage(existing []asn1.ObjectIdentifier, additional []asn1.O
 	return merged
 }
 
-func resolveVerificationExtKeyUsage(requiredUsage []asn1.ObjectIdentifier, defaultUsage x509.ExtKeyUsage) x509.ExtKeyUsage {
-	if len(requiredUsage) != 1 {
-		return defaultUsage
-	}
-	if requiredUsage[0].Equal(serverAuthOID) {
-		return x509.ExtKeyUsageServerAuth
-	}
-	if requiredUsage[0].Equal(clientAuthOID) {
-		return x509.ExtKeyUsageClientAuth
-	}
-	return x509.ExtKeyUsageAny
-}
-
 var (
 	serverAuthOID          = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 1}
 	clientAuthOID          = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 2}
@@ -709,16 +779,13 @@ func parseObjectIdentifier(value string) (asn1.ObjectIdentifier, error) {
 	return identifier, nil
 }
 
-// Upstream --peer-fingerprint compares the leaf certificate's SHA256 digest
-// against the configured hash list.
-func verifyPeerFingerprint(verifiedChains [][]*x509.Certificate, expectedFingerprints []string) error {
+// Upstream verify_cert compares the SHA256 digest of the certificate at
+// verify_hash_depth, which --peer-fingerprint pins to the leaf.
+func verifyPeerFingerprint(peerCertificate *x509.Certificate, expectedFingerprints []string) error {
 	if len(expectedFingerprints) == 0 {
 		return nil
 	}
-	if len(verifiedChains) == 0 || len(verifiedChains[0]) == 0 {
-		return E.New("peer-fingerprint requires a verified certificate chain")
-	}
-	actualFingerprint := computeCertificateFingerprint(verifiedChains[0][0].Raw)
+	actualFingerprint := computeCertificateFingerprint(peerCertificate.Raw)
 	if slices.Contains(expectedFingerprints, actualFingerprint) {
 		return nil
 	}

@@ -47,20 +47,20 @@ func equalClientCertificateIdentity(left *tlsClientCertificateIdentity, right *t
 }
 
 func (s *tlsServerSession) lockInitialCertificateIdentity(connection *tls.Conn) {
-	s.clientCertificateIdentity = clientCertificateIdentity(connection)
+	s.lockedCertificateIdentity.Store(clientCertificateIdentity(connection))
 	s.clientCertificateIdentitySet = true
 }
 
 func (s *tlsServerSession) verifyLockedCertificateIdentity(connection *tls.Conn) error {
 	currentIdentity := clientCertificateIdentity(connection)
-	if !s.clientCertificateIdentitySet || !equalClientCertificateIdentity(s.clientCertificateIdentity, currentIdentity) {
+	if !s.clientCertificateIdentitySet || !equalClientCertificateIdentity(s.lockedCertificateIdentity.Load(), currentIdentity) {
 		return E.Extend(ErrPeerCertificateVerification, "client certificate identity changed during renegotiation")
 	}
 	return nil
 }
 
 func (s *tlsServerSession) authenticatedIdentityKey() string {
-	if certificateIdentity := s.clientCertificateIdentity; certificateIdentity != nil {
+	if certificateIdentity := s.lockedCertificateIdentity.Load(); certificateIdentity != nil {
 		if certificateIdentity.commonName != "" {
 			return "x509-cn:" + certificateIdentity.commonName
 		}

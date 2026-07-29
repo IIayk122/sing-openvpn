@@ -21,10 +21,12 @@ import (
 )
 
 func TestOpenVPNInteropClientToRealServer(t *testing.T) {
+	t.Parallel()
 	runInteropDirection(t, interopDirectionClientToRealServer)
 }
 
 func TestOpenVPNInteropRealClientToRepoServer(t *testing.T) {
+	t.Parallel()
 	runInteropDirection(t, interopDirectionRealClientToServer)
 }
 
@@ -35,6 +37,7 @@ func runInteropDirection(t *testing.T, direction interopDirection) {
 			continue
 		}
 		t.Run(scenario.Name, func(scenarioTest *testing.T) {
+			scenarioTest.Parallel()
 			if scenario.Current == interopCurrentSkip {
 				scenarioTest.Skip(scenario.SkipReason)
 			}
@@ -46,6 +49,7 @@ func runInteropDirection(t *testing.T, direction interopDirection) {
 					}
 					runCount++
 					scenarioTest.Run("openvpn_"+version, func(versionTest *testing.T) {
+						versionTest.Parallel()
 						env := requireInteropEnvironmentVersion(versionTest, version)
 						runInteropScenario(versionTest, env, scenario)
 					})
@@ -66,6 +70,7 @@ func runInteropDirection(t *testing.T, direction interopDirection) {
 				}
 				runCount++
 				scenarioTest.Run("openvpn_"+version, func(versionTest *testing.T) {
+					versionTest.Parallel()
 					env := requireInteropEnvironmentVersion(versionTest, version)
 					runInteropScenario(versionTest, env, scenario)
 				})
@@ -135,14 +140,14 @@ func runStaticClientToRealServerScenario(t *testing.T, env interopEnvironment, s
 		clientKeyDirection = -1
 	}
 	if strings.HasPrefix(scenario.Protocol, "tcp") {
-		serverPort = reserveTCPPort(t)
-		clientPort = reserveTCPPort(t)
+		serverPort = reserveInteropPort(t, "tcp")
+		clientPort = reserveInteropPort(t, "tcp")
 		portBindings = tcpPortBinding(serverPort)
 		serverProtocol = staticInteropProtocolName(scenario.Protocol, true)
 		serverReady = []string{"Listening for incoming TCP connection"}
 	} else {
-		serverPort = reserveUDPPort(t)
-		clientPort = reserveUDPPort(t)
+		serverPort = reserveInteropPort(t, "udp")
+		clientPort = reserveInteropPort(t, "udp")
 		portBindings = udpPortBinding(serverPort)
 		serverProtocol = staticInteropProtocolName(scenario.Protocol, true)
 		serverReady = []string{"UDPv4 link remote", "UDPv6 link remote"}
@@ -164,7 +169,7 @@ func runStaticClientToRealServerScenario(t *testing.T, env interopEnvironment, s
 		PingExitSeconds: int64(scenario.ServerPingExit / time.Second),
 	})
 	startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-real-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-real-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"bash", "-lc", "openvpn --config " + filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "server-static.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},
@@ -275,17 +280,17 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 	)
 	if strings.HasPrefix(scenario.Protocol, "tcp") {
 		if strings.HasSuffix(scenario.Protocol, "6") {
-			serverPort = reserveTCPPort(t)
-			clientPort = reserveTCPPort(t)
+			serverPort = reserveInteropPort(t, "tcp")
+			clientPort = reserveInteropPort(t, "tcp")
 			portBindings = tcp6PortBinding(serverPort)
 		} else {
-			serverPort = reserveTCPPort(t)
-			clientPort = reserveTCPPort(t)
+			serverPort = reserveInteropPort(t, "tcp")
+			clientPort = reserveInteropPort(t, "tcp")
 			portBindings = tcpPortBinding(serverPort)
 		}
 	} else {
-		serverPort = reserveUDPPort(t)
-		clientPort = reserveUDPPort(t)
+		serverPort = reserveInteropPort(t, "udp")
+		clientPort = reserveInteropPort(t, "udp")
 		if strings.HasSuffix(scenario.Protocol, "6") {
 			portBindings = udp6PortBinding(serverPort)
 		} else {
@@ -339,7 +344,7 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 		LogPath:              filepath.ToSlash(filepath.Join(openVPNInteropRoot, "logs", "server.log")),
 	})
 	serverContainer := startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-real-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-real-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"bash", "-lc", "openvpn --config " + filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "server-tls.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},
@@ -482,7 +487,7 @@ func runTLSClientToRealServerScenario(t *testing.T, env interopEnvironment, scen
 	}
 	if mssCapture != nil {
 		sourceAddress, destinationAddress := tunnelEchoAddresses(configuration)
-		synPacket := buildIPv4TCPSYNPacket(t, sourceAddress, destinationAddress, 0x9c40, 9, 1460)
+		synPacket := buildIPv4TCPSYNPacket(t, sourceAddress, destinationAddress, 0x9c40, 9, 1460, 0)
 		writeClientDataPacket(t, client, synPacket, 10*time.Second)
 		decodedPackets := mssCapture.Decode(t)
 		expectedMSS := "mss " + fmt.Sprintf("%d", scenario.ExpectedMSS)
@@ -637,9 +642,9 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 
 	var listenPort int
 	if strings.HasPrefix(scenario.Protocol, "tcp") {
-		listenPort = reserveTCPPort(t)
+		listenPort = reserveInteropPort(t, "tcp")
 	} else {
-		listenPort = reserveUDPPort(t)
+		listenPort = reserveInteropPort(t, "udp")
 	}
 
 	pushConfiguration := baseTLSPushConfiguration()
@@ -765,7 +770,7 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 			expectedFailureMarkers = []string{"tls error", "tls-error", "server poll timeout", "key negotiation failed"}
 		}
 		startInteropContainer(t, env.docker, dockerContainerOptions{
-			Name:       "sing-openvpn-real-client-" + sanitizeDockerName(t.Name()),
+			Name:       "sing-openvpn-real-client-" + uniqueDockerName(t.Name()),
 			Image:      env.image,
 			Command:    []string{"bash", "-lc", "openvpn --config " + filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "client-tls.conf")) + " --connect-timeout 5 --connect-retry-max 1 --hand-window 5"},
 			Binds:      []string{workspace.root + ":" + openVPNInteropRoot},
@@ -785,7 +790,7 @@ func runTLSRealClientToRepoServerScenario(t *testing.T, env interopEnvironment, 
 		clientDataCommand += " && until [ \"$(grep -c 'Outgoing Data Channel: Cipher' " + clientLogPath + ")\" -ge 2 ]; do sleep 0.1; done && ping -c 1 -W 3 10.8.0.1"
 	}
 	clientContainer := startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:       "sing-openvpn-real-client-" + sanitizeDockerName(t.Name()),
+		Name:       "sing-openvpn-real-client-" + uniqueDockerName(t.Name()),
 		Image:      env.image,
 		Command:    []string{"bash", "-lc", "openvpn --config " + filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "client-tls.conf")) + " --daemon --writepid " + filepath.ToSlash(filepath.Join(openVPNInteropRoot, "client.pid")) + " && until grep -q 'Initialization Sequence Completed' " + filepath.ToSlash(filepath.Join(openVPNInteropRoot, "logs", "client.log")) + "; do sleep 0.1; done && " + clientDataCommand},
 		Binds:      []string{workspace.root + ":" + openVPNInteropRoot},
@@ -845,6 +850,10 @@ func dockerPathIf(enabled bool, elements ...string) string {
 	if !enabled {
 		return ""
 	}
+	return dockerPath(elements...)
+}
+
+func dockerPath(elements ...string) string {
 	return filepath.ToSlash(filepath.Join(append([]string{openVPNInteropRoot}, elements...)...))
 }
 

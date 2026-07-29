@@ -7,10 +7,24 @@ nobind
 persist-key
 persist-tun
 remote-cert-tls server
+{{- if .CAPath }}
 ca {{ .CAPath }}
+{{- end }}
 cert {{ .CertPath }}
 key {{ .KeyPath }}
+{{- range .PeerFingerprints }}
+peer-fingerprint {{ . }}
+{{- end }}
 verb 4
+{{- if .Topology }}
+topology {{ .Topology }}
+{{- end }}
+{{- if .VerifyX509Name }}
+verify-x509-name "{{ .VerifyX509Name }}"{{ if .VerifyX509Type }} {{ .VerifyX509Type }}{{ end }}
+{{- end }}
+{{- if .CRLVerifyPath }}
+crl-verify {{ .CRLVerifyPath }}
+{{- end }}
 {{- if .Cipher }}
 cipher {{ .Cipher }}
 {{- end }}

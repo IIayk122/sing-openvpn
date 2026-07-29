@@ -10,38 +10,36 @@ import (
 )
 
 func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
-	_, writeErr := c.tlsConnection.Write(append([]byte(pushRequestPayload), 0))
-	if writeErr != nil {
-		return "", "", writeErr
-	}
-	selectedCipher := tlsPreferredCipher(c.parent.options)
+	selectedCipher := ""
 	selectedAuth := c.parent.options.DataChannel.Auth
 	if selectedAuth == "" {
 		selectedAuth = "SHA1"
 	}
-	pushedCipherSeen := false
-	var accumulatedPushReplyFields []string
+	var accumulatedPushReplyLines []string
 	pushContinuationPending := false
 	authenticationPending := false
 	now := time.Now()
 	deadline := now.Add(c.parent.options.Timing.HandWindow)
+	writeErr := c.writeControlChannelPayload(tlsControlStringPayload([]byte(pushRequestPayload)), deadline)
+	if writeErr != nil {
+		return "", "", writeErr
+	}
 	nextPushRequest := now.Add(tlsPushRequestResendInterval)
-	lastInboundTime := now
 	pingRestart := c.prePullPingRestart()
 	for time.Now().Before(deadline) {
-		readTimeout := time.Until(deadline)
-		if resendTimeout := time.Until(nextPushRequest); resendTimeout < readTimeout {
-			readTimeout = resendTimeout
+		readDeadline := deadline
+		if nextPushRequest.Before(readDeadline) {
+			readDeadline = nextPushRequest
 		}
+		var lastInboundTime time.Time
 		if pingRestart > 0 {
-			if pingTimeout := time.Until(lastInboundTime.Add(pingRestart)); pingTimeout < readTimeout {
-				readTimeout = pingTimeout
+			lastInboundTime, _ = c.keepalive.snapshotActivity()
+			pingDeadline := lastInboundTime.Add(pingRestart)
+			if pingDeadline.Before(readDeadline) {
+				readDeadline = pingDeadline
 			}
 		}
-		if readTimeout <= 0 {
-			readTimeout = time.Millisecond
-		}
-		controlRecord, readErr := readTLSControlRecord(c.tlsConnection, readTimeout)
+		controlRecord, readErr := c.readControlChannelRecord(readDeadline)
 		if readErr != nil {
 			cancelErr := c.canceledChallengeError()
 			if cancelErr != nil {
@@ -51,11 +49,14 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 				return "", "", readErr
 			}
 			now = time.Now()
-			if pingRestart > 0 && !now.Before(lastInboundTime.Add(pingRestart)) {
-				return "", "", ErrPingRestartTimeout
+			if pingRestart > 0 {
+				lastInboundTime, _ = c.keepalive.snapshotActivity()
+				if shouldExitForPingTimeout(lastInboundTime, now, pingRestart) {
+					return "", "", ErrPingRestartTimeout
+				}
 			}
 			if !now.Before(nextPushRequest) {
-				_, writeErr = c.tlsConnection.Write(append([]byte(pushRequestPayload), 0))
+				writeErr = c.writeControlChannelPayload(tlsControlStringPayload([]byte(pushRequestPayload)), deadline)
 				if writeErr != nil {
 					return "", "", writeErr
 				}
@@ -63,7 +64,6 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 			}
 			continue
 		}
-		lastInboundTime = time.Now()
 		switch classifyTLSControlDirective(controlRecord) {
 		case tlsControlDirectiveAuthFailed:
 			return "", "", c.authFailedError(controlRecord)
@@ -84,17 +84,21 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 		case tlsControlDirectiveInfo, tlsControlDirectiveCRResponse:
 			continue
 		case tlsControlDirectivePushReply:
-			accumulatedFields, continuation, decoded := appendPushReplyPayloadSegment(accumulatedPushReplyFields, controlRecord)
+			accumulatedLines, continuation, decoded := appendPushReplyPayloadSegment(accumulatedPushReplyLines, controlRecord)
 			var decodedPushedOptions pushedOptions
 			if decoded {
-				accumulatedPushReplyFields = accumulatedFields
+				accumulatedPushReplyLines = accumulatedLines
 				pushContinuationPending = continuation == 2
 				if pushContinuationPending {
 					continue
 				}
-				pushReplyPayload := []byte(strings.Join(accumulatedPushReplyFields, ","))
-				accumulatedPushReplyFields = nil
-				decodedPushedOptions, _, decoded = decodePushReplyPayloadWithFilters(pushReplyPayload, c.remoteTransportAddress(), c.parent.options.Pull.Filters)
+				decodedPushedOptions, _ = decodePushReplyOptionLines(
+					accumulatedPushReplyLines[0],
+					accumulatedPushReplyLines[1:],
+					c.remoteTransportAddress(),
+					c.parent.options.Pull.Filters,
+				)
+				accumulatedPushReplyLines = nil
 			} else {
 				decodedPushedOptions, continuation, decoded = decodePushReplyPayloadWithFilters(controlRecord, c.remoteTransportAddress(), c.parent.options.Pull.Filters)
 				pushContinuationPending = continuation == 2
@@ -108,16 +112,15 @@ func (c *tlsClient) pullConfigurationAndCipher() (string, string, error) {
 			}
 			if decodedPushedOptions.SelectedCipher != "" {
 				selectedCipher = decodedPushedOptions.SelectedCipher
-				pushedCipherSeen = true
 			}
 			if decodedPushedOptions.SelectedAuth != "" {
 				selectedAuth = decodedPushedOptions.SelectedAuth
 			}
 			if continuation != 2 {
-				if !pushedCipherSeen {
-					resolvedCipher, err := applyCipherNegotiationFallback(c.parent.options, c.remoteCipherName)
-					if err != nil {
-						return "", "", err
+				if selectedCipher == "" {
+					resolvedCipher, resolveErr := selectPulledCipher(c.parent.options, c.remoteCipherName)
+					if resolveErr != nil {
+						return "", "", resolveErr
 					}
 					selectedCipher = resolvedCipher
 				}
@@ -142,7 +145,7 @@ func (c *tlsClient) controlMessageLoop() {
 			return
 		default:
 		}
-		controlRecord, err := readTLSControlRecord(c.tlsConnection, time.Second)
+		controlRecord, err := c.readControlChannelRecord(time.Now().Add(time.Second))
 		if err != nil {
 			if E.IsTimeout(err) {
 				continue
@@ -186,32 +189,28 @@ func (c *tlsClient) sendExplicitExitNotifyIfRequested() {
 		return
 	}
 	if shouldSendCCExitOverControlChannel(tunnelConfiguration) {
-		if c.tlsConnection == nil {
+		primaryChannel := c.primaryControlChannel()
+		if primaryChannel == nil {
 			return
 		}
-		deadlineErr := c.controlChannel.SetWriteDeadline(time.Now().Add(time.Second))
-		if deadlineErr != nil {
-			return
-		}
-		_, _ = c.tlsConnection.Write(tlsControlChannelExitPayload)
+		exitDeadline := time.Now().Add(time.Second)
+		_ = primaryChannel.SetWriteDeadline(exitDeadline)
+		_ = c.writeControlChannelPayload(tlsControlChannelExitPayload, exitDeadline)
 		return
 	}
 	sendCodec, _ := c.currentSendCodec()
 	if sendCodec == nil {
 		return
 	}
+	// Upstream process_explicit_exit_notification_timer_wakeup (forward.c)
+	// re-stamps occ_op with OCC_EXIT on every one-second tick until the
+	// notification window closes, so a notification the link refuses costs that
+	// tick alone and the remaining ones are still sent.
 	for retry := range notifyCount {
 		if retry > 0 {
 			time.Sleep(time.Second)
 		}
-		deadlineErr := c.controlChannel.SetWriteDeadline(time.Now().Add(time.Second))
-		if deadlineErr != nil {
-			return
-		}
-		writeErr := c.tryWriteDataPacket(openVPNDataChannelExitNotifyPayload)
-		if writeErr != nil {
-			return
-		}
+		c.writeDataPacketWithinTick(openVPNDataChannelExitNotifyPayload, time.Second)
 	}
 }
 

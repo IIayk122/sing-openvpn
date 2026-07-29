@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"text/template"
 	"time"
@@ -32,15 +35,25 @@ import (
 )
 
 const (
-	openVPNInteropEnvVar         = "OPENVPN_IT"
 	openVPNInteropDefaultVersion = "2.6.14"
 	openVPNInteropRoot           = "/interop"
+	interopPollInterval          = 25 * time.Millisecond
+	interopPortRangeStart        = 20000
+	interopPortRangeSize         = 25000
 )
 
 var (
 	openVPNInteropClientOnce sync.Once
 	openVPNInteropClientErr  error
 	openVPNInteropClient     *client.Client
+
+	openVPNInteropTunDeviceOnce sync.Once
+	openVPNInteropTunDeviceErr  error
+
+	interopRunToken     = strconv.FormatUint(rand.Uint64(), 36)
+	interopNameCounter  atomic.Uint64
+	interopPortAccess   sync.Mutex
+	interopClaimedPorts = make(map[int]struct{})
 
 	openVPNInteropImageDescriptors = map[string]*openVPNInteropImageDescriptor{
 		"2.4.12": {
@@ -112,6 +125,11 @@ type tlsServerTemplateData struct {
 	CAPath               string
 	CertPath             string
 	KeyPath              string
+	PeerFingerprints     []string
+	NSCertType           string
+	VerifyX509Name       string
+	VerifyX509Type       string
+	CRLVerifyPath        string
 	TLSAuthPath          string
 	TLSCryptPath         string
 	TLSCryptV2Path       string
@@ -124,6 +142,8 @@ type tlsServerTemplateData struct {
 	TunMTU               uint32
 	Fragment             uint32
 	MSSFix               uint32
+	MSSFixMode           string
+	MSSFixDisabled       bool
 	Compression          string
 	CompressionLZO       string
 	RenegotiationSeconds int64
@@ -139,9 +159,14 @@ type tlsClientTemplateData struct {
 	Protocol             string
 	RemoteHost           string
 	RemotePort           int
+	Topology             string
 	CAPath               string
 	CertPath             string
 	KeyPath              string
+	PeerFingerprints     []string
+	VerifyX509Name       string
+	VerifyX509Type       string
+	CRLVerifyPath        string
 	TLSAuthPath          string
 	TLSCryptPath         string
 	TLSCryptV2Path       string
@@ -239,36 +264,23 @@ func (c *interopRecordedConn) Write(buffer []byte) (int, error) {
 
 func requireInteropEnvironmentVersion(t *testing.T, version string) interopEnvironment {
 	t.Helper()
-	if os.Getenv(openVPNInteropEnvVar) == "" {
-		t.Skipf("%s is not set", openVPNInteropEnvVar)
-	}
 	descriptor, found := openVPNInteropImageDescriptors[version]
 	if !found {
 		t.Fatalf("unsupported OpenVPN interop version: %s", version)
 	}
 	dockerClient := mustDockerClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err := dockerClient.Ping(ctx)
-	if err != nil {
-		t.Fatalf("docker daemon is unavailable: %v", err)
-	}
-	ensureDockerImage(t, dockerClient, "alpine:3.20")
-	tunCheck := runDockerContainerAndWait(t, dockerClient, dockerContainerOptions{
-		Name:       "sing-openvpn-interop-tun-check-" + sanitizeDockerName(t.Name()),
-		Image:      "alpine:3.20",
-		Command:    []string{"sh", "-lc", "[ -e /dev/net/tun ] && echo ok || echo no"},
-		Privileged: true,
-	}, 15*time.Second)
-	if tunCheck.ExitCode != 0 || strings.TrimSpace(tunCheck.Logs) != "ok" {
-		t.Fatalf("privileged containers do not expose /dev/net/tun: %s", strings.TrimSpace(tunCheck.Logs))
+	openVPNInteropTunDeviceOnce.Do(func() {
+		openVPNInteropTunDeviceErr = verifyDockerTunDevice(dockerClient)
+	})
+	if openVPNInteropTunDeviceErr != nil {
+		t.Fatalf("verify docker interop environment: %v", openVPNInteropTunDeviceErr)
 	}
 	descriptor.buildOnce.Do(func() {
 		inspectContext, cancelInspect := context.WithTimeout(context.Background(), 10*time.Second)
 		_, _, inspectErr := dockerClient.ImageInspectWithRaw(inspectContext, descriptor.image)
 		cancelInspect()
 		if inspectErr == nil {
-			descriptor.versionErr = verifyInteropImageVersion(t, dockerClient, descriptor, "cached")
+			descriptor.versionErr = verifyInteropImageVersion(dockerClient, descriptor, "cached")
 			if descriptor.versionErr == nil {
 				return
 			}
@@ -279,7 +291,7 @@ func requireInteropEnvironmentVersion(t *testing.T, version string) interopEnvir
 		}
 		descriptor.buildErr = buildInteropImage(dockerClient, descriptor.image, filepath.Join("testdata", "openvpn", "docker"), descriptor.baseImage, descriptor.packageVersion)
 		if descriptor.buildErr == nil {
-			descriptor.versionErr = verifyInteropImageVersion(t, dockerClient, descriptor, "rebuilt")
+			descriptor.versionErr = verifyInteropImageVersion(dockerClient, descriptor, "rebuilt")
 		}
 	})
 	if descriptor.buildErr != nil {
@@ -295,22 +307,49 @@ func requireInteropEnvironmentVersion(t *testing.T, version string) interopEnvir
 	}
 }
 
+func verifyDockerTunDevice(dockerClient *client.Client) error {
+	pingContext, cancelPing := context.WithTimeout(context.Background(), 10*time.Second)
+	_, err := dockerClient.Ping(pingContext)
+	cancelPing()
+	if err != nil {
+		return E.Cause(err, "docker daemon is unavailable")
+	}
+	err = ensureDockerImage(dockerClient, "alpine:3.20")
+	if err != nil {
+		return err
+	}
+	tunCheck, err := runDetachedDockerContainer(dockerClient, dockerContainerOptions{
+		Name:       "sing-openvpn-interop-tun-check-" + uniqueDockerName("shared"),
+		Image:      "alpine:3.20",
+		Command:    []string{"sh", "-lc", "[ -e /dev/net/tun ] && echo ok || echo no"},
+		Privileged: true,
+	}, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	if tunCheck.ExitCode != 0 || strings.TrimSpace(tunCheck.Logs) != "ok" {
+		return E.New("privileged containers do not expose /dev/net/tun: ", strings.TrimSpace(tunCheck.Logs))
+	}
+	return nil
+}
+
 func verifyInteropImageVersion(
-	t *testing.T,
 	dockerClient *client.Client,
 	descriptor *openVPNInteropImageDescriptor,
 	attempt string,
 ) error {
-	t.Helper()
-	versionCheck := runDockerContainerAndWait(t, dockerClient, dockerContainerOptions{
-		Name:  "sing-openvpn-interop-version-" + sanitizeDockerName(descriptor.version+"-"+attempt+"-"+t.Name()),
+	versionCheck, err := runDetachedDockerContainer(dockerClient, dockerContainerOptions{
+		Name:  "sing-openvpn-interop-version-" + uniqueDockerName(descriptor.version+"-"+attempt),
 		Image: descriptor.image,
 		Command: []string{
 			"sh",
 			"-lc",
 			"dpkg-query -W -f='${Version}\\n' openvpn && openvpn --version",
 		},
-	}, 15*time.Second)
+	}, 30*time.Second)
+	if err != nil {
+		return err
+	}
 	packageVersion, remainingOutput, hasVersionOutput := strings.Cut(versionCheck.Logs, "\n")
 	if !hasVersionOutput {
 		return E.New("missing OpenVPN version output: ", strings.TrimSpace(versionCheck.Logs))
@@ -330,10 +369,7 @@ func mustDockerClient(t *testing.T) *client.Client {
 	t.Helper()
 	openVPNInteropClientOnce.Do(func() {
 		clientOptions := []client.Opt{client.WithAPIVersionNegotiation()}
-		dockerHost := os.Getenv("DOCKER_HOST")
 		switch {
-		case dockerHost != "":
-			clientOptions = append(clientOptions, client.WithHost(dockerHost))
 		case fileExists("/Users/sekai/.orbstack/run/docker.sock"):
 			clientOptions = append(clientOptions, client.WithHost("unix:///Users/sekai/.orbstack/run/docker.sock"))
 		case fileExists("/var/run/docker.sock"):
@@ -355,23 +391,23 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func ensureDockerImage(t *testing.T, dockerClient *client.Client, imageRef string) {
-	t.Helper()
+func ensureDockerImage(dockerClient *client.Client, imageRef string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	_, _, err := dockerClient.ImageInspectWithRaw(ctx, imageRef)
 	if err == nil {
-		return
+		return nil
 	}
 	if !errdefs.IsNotFound(err) {
-		t.Fatalf("inspect docker image %s: %v", imageRef, err)
+		return E.Cause(err, "inspect docker image ", imageRef)
 	}
 	reader, err := dockerClient.ImagePull(ctx, imageRef, typesapi.ImagePullOptions{})
 	if err != nil {
-		t.Fatalf("pull docker image %s: %v", imageRef, err)
+		return E.Cause(err, "pull docker image ", imageRef)
 	}
 	defer reader.Close()
 	_, _ = io.Copy(io.Discard, reader)
+	return nil
 }
 
 func buildInteropImage(dockerClient *client.Client, imageTag string, contextDir string, baseImage string, packageVersion string) error {
@@ -641,10 +677,43 @@ func prepareInteropLogFiles(t *testing.T, binds []string) {
 	}
 }
 
-func runDockerContainerAndWait(t *testing.T, dockerClient *client.Client, options dockerContainerOptions, timeout time.Duration) dockerWaitResult {
-	t.Helper()
-	containerHandle := startInteropContainer(t, dockerClient, options)
-	return containerHandle.Wait(t, timeout)
+func runDetachedDockerContainer(dockerClient *client.Client, options dockerContainerOptions, timeout time.Duration) (dockerWaitResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	createdContainer, err := dockerClient.ContainerCreate(ctx, &containerapi.Config{
+		Image: options.Image,
+		Cmd:   options.Command,
+	}, &containerapi.HostConfig{Privileged: options.Privileged}, nil, nil, options.Name)
+	if err != nil {
+		return dockerWaitResult{}, E.Cause(err, "create docker container ", options.Name)
+	}
+	defer func() {
+		_ = removeInteropContainer(context.Background(), dockerClient, createdContainer.ID)
+	}()
+	err = dockerClient.ContainerStart(ctx, createdContainer.ID, containerapi.StartOptions{})
+	if err != nil {
+		return dockerWaitResult{}, E.Cause(err, "start docker container ", options.Name)
+	}
+	containerHandle := &interopContainer{
+		client:      dockerClient,
+		containerID: createdContainer.ID,
+		name:        options.Name,
+	}
+	statusChannel, errorChannel := dockerClient.ContainerWait(ctx, createdContainer.ID, containerapi.WaitConditionNotRunning)
+	select {
+	case waitErr := <-errorChannel:
+		if waitErr == nil {
+			return dockerWaitResult{}, E.New("docker container ", options.Name, " reported no exit status")
+		}
+		return dockerWaitResult{}, E.Cause(waitErr, "wait docker container ", options.Name)
+	case status := <-statusChannel:
+		return dockerWaitResult{
+			ExitCode: status.StatusCode,
+			Logs:     containerHandle.logs(context.Background()),
+		}, nil
+	case <-ctx.Done():
+		return dockerWaitResult{}, E.New("docker container ", options.Name, " timed out\nlogs:\n", containerHandle.logs(context.Background()))
+	}
 }
 
 type dockerWaitResult struct {
@@ -757,7 +826,7 @@ func (c *interopPacketCapture) Decode(t *testing.T) string {
 	t.Helper()
 	waitForLogLine(t, c.localLogPath, "captured", 10*time.Second)
 	temporaryDecodedPath := c.dockerDecodedPath + ".tmp"
-	decodeCommand := "tcpdump -nn -r " + c.dockerPacketPath + " > " + temporaryDecodedPath + " 2>&1 && mv " + temporaryDecodedPath + " " + c.dockerDecodedPath
+	decodeCommand := "tcpdump -vv -nn -r " + c.dockerPacketPath + " > " + temporaryDecodedPath + " 2>&1 && mv " + temporaryDecodedPath + " " + c.dockerDecodedPath
 	c.container.ExecDetached(t, []string{"bash", "-lc", decodeCommand})
 	waitForFile(t, c.localDecodedPath, 10*time.Second)
 	decodedPackets, err := os.ReadFile(c.localDecodedPath)
@@ -775,7 +844,7 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 		if err == nil {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(interopPollInterval)
 	}
 	t.Fatalf("timed out waiting for %s", path)
 }
@@ -788,7 +857,7 @@ func waitForLogLine(t *testing.T, logPath string, want string, timeout time.Dura
 		if err == nil && strings.Contains(string(logContent), want) {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(interopPollInterval)
 	}
 	logContent, _ := os.ReadFile(logPath)
 	t.Fatalf("timed out waiting for %q in %s\n%s", want, logPath, string(logContent))
@@ -818,30 +887,51 @@ func waitForAnyLogLine(t *testing.T, logPath string, want []string, timeout time
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(interopPollInterval)
 	}
 	logContent, _ := os.ReadFile(logPath)
 	t.Fatalf("timed out waiting for any of %q in %s\n%s", want, logPath, string(logContent))
 }
 
-func reserveUDPPort(t *testing.T) int {
+func reserveInteropPort(t *testing.T, protocol string) int {
 	t.Helper()
-	listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve udp port: %v", err)
+	network := "udp"
+	if strings.HasPrefix(protocol, "tcp") {
+		network = "tcp"
 	}
-	defer listener.Close()
-	return listener.LocalAddr().(*net.UDPAddr).Port
+	for range 512 {
+		port := interopPortRangeStart + rand.IntN(interopPortRangeSize)
+		interopPortAccess.Lock()
+		_, claimed := interopClaimedPorts[port]
+		if !claimed {
+			interopClaimedPorts[port] = struct{}{}
+		}
+		interopPortAccess.Unlock()
+		if claimed {
+			continue
+		}
+		if interopPortIsFree(network, port) {
+			return port
+		}
+	}
+	t.Fatalf("reserve free %s port", network)
+	return 0
 }
 
-func reserveTCPPort(t *testing.T) int {
-	t.Helper()
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve tcp port: %v", err)
+func interopPortIsFree(network string, port int) bool {
+	address := ":" + strconv.Itoa(port)
+	if network == "tcp" {
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			return false
+		}
+		return listener.Close() == nil
 	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port
+	packetConn, err := net.ListenPacket("udp", address)
+	if err != nil {
+		return false
+	}
+	return packetConn.Close() == nil
 }
 
 func bindPortDialContextWithRecorder(localPort int, recorder *interopPacketLengthRecorder) func(ctx context.Context, network string, address string) (net.Conn, error) {
@@ -919,6 +1009,15 @@ func udpPortBinding(port int) nat.PortMap {
 	}
 }
 
+func udpHostGatewayPortBinding(port int) nat.PortMap {
+	containerPort := nat.Port(fmt.Sprintf("%d/udp", port))
+	return nat.PortMap{
+		containerPort: []nat.PortBinding{
+			{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", port)},
+		},
+	}
+}
+
 func udp6PortBinding(port int) nat.PortMap {
 	containerPort := nat.Port(fmt.Sprintf("%d/udp", port))
 	return nat.PortMap{
@@ -946,9 +1045,9 @@ func tcp6PortBinding(port int) nat.PortMap {
 	}
 }
 
-func sanitizeDockerName(name string) string {
+func uniqueDockerName(name string) string {
 	replacer := strings.NewReplacer("/", "-", "_", "-", " ", "-")
-	return strings.ToLower(replacer.Replace(name))
+	return strings.ToLower(replacer.Replace(name)) + "-" + interopRunToken + "-" + strconv.FormatUint(interopNameCounter.Add(1), 36)
 }
 
 func buildStaticICMPEchoRequest(t *testing.T, source netip.Addr, destination netip.Addr, identifier uint16, sequence uint16, payload []byte) []byte {
@@ -979,15 +1078,19 @@ func buildStaticICMPEchoRequest(t *testing.T, source netip.Addr, destination net
 	return ipv4Packet
 }
 
-func buildIPv4TCPSYNPacket(t *testing.T, source netip.Addr, destination netip.Addr, sourcePort uint16, destinationPort uint16, segmentSize uint16) []byte {
+func buildIPv4TCPSYNPacket(t *testing.T, source netip.Addr, destination netip.Addr, sourcePort uint16, destinationPort uint16, segmentSize uint16, leadingNOPCount int) []byte {
 	t.Helper()
 	if !source.Is4() || !destination.Is4() {
 		t.Fatal("only IPv4 TCP is implemented in the real interop harness")
 	}
-	const (
-		ipv4HeaderLength = 20
-		tcpHeaderLength  = 24
-	)
+	if leadingNOPCount < 0 || leadingNOPCount > 3 {
+		t.Fatal("leading NOP count must fit the TCP option padding")
+	}
+	const ipv4HeaderLength = 20
+	tcpHeaderLength := 24
+	if leadingNOPCount > 0 {
+		tcpHeaderLength = 28
+	}
 	packet := make([]byte, ipv4HeaderLength+tcpHeaderLength)
 	packet[0] = 0x45
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
@@ -1004,12 +1107,20 @@ func buildIPv4TCPSYNPacket(t *testing.T, source netip.Addr, destination netip.Ad
 	binary.BigEndian.PutUint16(tcpSegment[0:2], sourcePort)
 	binary.BigEndian.PutUint16(tcpSegment[2:4], destinationPort)
 	binary.BigEndian.PutUint32(tcpSegment[4:8], 1)
-	tcpSegment[12] = 6 << 4
+	tcpSegment[12] = byte(tcpHeaderLength/4) << 4
 	tcpSegment[13] = 0x02
 	binary.BigEndian.PutUint16(tcpSegment[14:16], 65535)
-	tcpSegment[20] = 2
-	tcpSegment[21] = 4
-	binary.BigEndian.PutUint16(tcpSegment[22:24], segmentSize)
+	optionOffset := 20
+	for range leadingNOPCount {
+		tcpSegment[optionOffset] = 1
+		optionOffset++
+	}
+	tcpSegment[optionOffset] = 2
+	tcpSegment[optionOffset+1] = 4
+	binary.BigEndian.PutUint16(tcpSegment[optionOffset+2:optionOffset+4], segmentSize)
+	for paddingOffset := optionOffset + 4; paddingOffset < tcpHeaderLength; paddingOffset++ {
+		tcpSegment[paddingOffset] = 1
+	}
 	pseudoHeader := make([]byte, 12+len(tcpSegment))
 	copy(pseudoHeader[0:4], sourceBytes[:])
 	copy(pseudoHeader[4:8], destinationBytes[:])
@@ -1118,7 +1229,7 @@ func waitForLogOccurrences(t *testing.T, logPath string, value string, expectedC
 		if err == nil && strings.Count(string(content), value) >= expectedCount {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(interopPollInterval)
 	}
 	t.Fatalf("timed out waiting for %d occurrences of %q in %s", expectedCount, value, logPath)
 }
@@ -1202,7 +1313,7 @@ func waitForClientIfconfig(t *testing.T, openVPNClient *openvpn.Client, timeout 
 		if len(configuration.LocalIPv4) > 0 {
 			return configuration
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(interopPollInterval)
 	}
 	t.Fatalf("timed out waiting for client pushed ifconfig")
 	return openvpn.TunnelConfiguration{}

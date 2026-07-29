@@ -103,27 +103,64 @@ func parseIfconfigPrefix(ifconfig string, topology string) (netip.Prefix, error)
 	}
 }
 
-func parseIfconfigIPv6Prefix(row string) (netip.Prefix, error) {
-	trimmed := strings.TrimSpace(row)
-	if trimmed == "" {
-		return netip.Prefix{}, E.New("empty ifconfig-ipv6")
-	}
-	tokens := strings.Fields(trimmed)
-	if strings.Contains(tokens[0], "/") {
-		prefix, err := netip.ParsePrefix(tokens[0])
-		if err != nil {
-			return netip.Prefix{}, E.Cause(err, "parse ifconfig-ipv6 cidr: ", tokens[0])
+// Upstream get_ipv6_addr (options.c) leaves an IPv6 prefix that carries no '/'
+// at /64, and reads the count behind the '/' with strtol(sep + 1, &endp, 10):
+// an empty count is 0, and a count the conversion does not consume whole, a
+// negative one or one above 128 rejects the prefix.
+func parseIPv6AddressPrefix(token string) (netip.Prefix, error) {
+	netbits := 64
+	addressToken, netbitsToken, netbitsFound := strings.Cut(token, "/")
+	if netbitsFound {
+		netbits = 0
+		if netbitsToken != "" {
+			parsedNetbits, err := strconv.Atoi(netbitsToken)
+			if err != nil || parsedNetbits < 0 || parsedNetbits > 128 {
+				return netip.Prefix{}, E.New("ipv6 prefix '", token, "': invalid '/bits' spec (", netbitsToken, ")")
+			}
+			netbits = parsedNetbits
 		}
-		if !prefix.Addr().Is6() {
-			return netip.Prefix{}, E.New("ipv6 ifconfig-ipv6 expected, got: ", tokens[0])
-		}
-		return prefix, nil
 	}
-	address, err := netip.ParseAddr(tokens[0])
+	address, err := parseIPv6Address(addressToken)
 	if err != nil {
-		return netip.Prefix{}, E.Cause(err, "parse ifconfig-ipv6 local: ", tokens[0])
+		return netip.Prefix{}, E.Cause(err, "ipv6 prefix '", token, "'")
 	}
-	return netip.PrefixFrom(address, 128), nil
+	return netip.PrefixFrom(address, netbits), nil
+}
+
+// Upstream get_ipv6_addr and ipv6_addr_safe (options.c) admit an address only
+// through inet_pton(AF_INET6), which takes neither an IPv4 address nor the
+// scope zone netip.ParseAddr accepts.
+func parseIPv6Address(token string) (netip.Addr, error) {
+	address, err := netip.ParseAddr(token)
+	if err != nil {
+		return netip.Addr{}, E.Cause(err, "parse ipv6 address: ", token)
+	}
+	if !address.Is6() || address.Zone() != "" {
+		return netip.Addr{}, E.New("ipv6 address expected, got: ", token)
+	}
+	return address, nil
+}
+
+// Upstream add_option (options.c) takes --ifconfig-ipv6 with exactly two
+// parameters, reads the local endpoint through get_ipv6_addr, requires the
+// remote endpoint to be a bare address, and refuses netbits outside 64..124.
+func parseIfconfigIPv6(row string) (netip.Prefix, netip.Addr, error) {
+	tokens := strings.Fields(strings.TrimSpace(row))
+	if len(tokens) != 2 {
+		return netip.Prefix{}, netip.Addr{}, E.New("ifconfig-ipv6 expects a local and a remote endpoint, got: ", row)
+	}
+	localPrefix, err := parseIPv6AddressPrefix(tokens[0])
+	if err != nil {
+		return netip.Prefix{}, netip.Addr{}, err
+	}
+	remoteAddress, err := parseIPv6Address(tokens[1])
+	if err != nil {
+		return netip.Prefix{}, netip.Addr{}, err
+	}
+	if localPrefix.Bits() < 64 || localPrefix.Bits() > 124 {
+		return netip.Prefix{}, netip.Addr{}, E.New("ifconfig-ipv6 netbits must be between 64 and 124, not '/", localPrefix.Bits(), "'")
+	}
+	return localPrefix, remoteAddress, nil
 }
 
 func parsePushedRoute(row string, remoteHost netip.Addr) (netip.Prefix, netip.Addr, int, bool, error) {
@@ -200,12 +237,9 @@ func parsePushedRouteIPv6(row string, remoteHost netip.Addr) (netip.Prefix, neti
 	if len(tokens) == 0 {
 		return netip.Prefix{}, netip.Addr{}, 0, false, E.New("empty route-ipv6")
 	}
-	prefix, err := netip.ParsePrefix(tokens[0])
+	prefix, err := parseIPv6AddressPrefix(tokens[0])
 	if err != nil {
-		return netip.Prefix{}, netip.Addr{}, 0, false, E.Cause(err, "parse route-ipv6 destination: ", tokens[0])
-	}
-	if !prefix.Addr().Is6() {
-		return netip.Prefix{}, netip.Addr{}, 0, false, E.New("ipv6 route-ipv6 expected, got: ", tokens[0])
+		return netip.Prefix{}, netip.Addr{}, 0, false, E.Cause(err, "parse route-ipv6 destination")
 	}
 	var gateway netip.Addr
 	metric := 0

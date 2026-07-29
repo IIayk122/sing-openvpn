@@ -4,6 +4,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"math/big"
 	"net"
 	"strconv"
@@ -64,6 +65,8 @@ func classifyClientSessionError(err error) clientSessionErrorClass {
 		ErrPeerCertificateNSCertType,
 		ErrCRLSignatureInvalid,
 		ErrCRLExpired,
+		ErrCRLUnavailable,
+		ErrCRLIssuerKeyUsage,
 		ErrMissingServer,
 		ErrUnsupportedProtocol,
 		ErrUnsupportedMode,
@@ -99,57 +102,45 @@ func classifyClientSessionError(err error) clientSessionErrorClass {
 	return clientSessionErrorRetryable
 }
 
-func (c *Client) acquireInteractiveCredentials(ctx context.Context, useActiveAuthToken bool) error {
+// Upstream auth_user_pass_setup (ssl.c) runs before every connection attempt but
+// queries the credentials only while neither auth_user_pass nor auth_token is
+// defined, so an answered challenge is asked for exactly once.
+func (c *Client) acquireSessionCredentials(ctx context.Context, useActiveAuthToken bool) error {
 	if c.mode != ModeTLS {
 		return nil
 	}
+	if c.loadStagedCredentials().defined {
+		return nil
+	}
 	if useActiveAuthToken {
-		c.tunnel.access.RLock()
-		tokenConfiguration := TunnelConfiguration{
-			AuthToken:     c.tunnel.authToken,
-			AuthTokenUser: c.tunnel.authTokenUser,
-		}
-		c.tunnel.access.RUnlock()
-		_, _, tokenDefined := resolveAuthTokenCredentials(c.options, tokenConfiguration, c.interactiveUsername())
+		_, _, tokenDefined := c.activeAuthTokenCredentials("")
 		if tokenDefined {
 			return nil
 		}
 	}
-	c.authentication.access.Lock()
-	hasStagedChallengeResponse := c.authentication.challengeResponsePassword != ""
-	hasInteractiveUserPass := c.authentication.interactiveUsername != "" || c.authentication.interactivePassword != ""
-	hasInteractiveSecret := c.authentication.interactiveSecret != ""
-	c.authentication.access.Unlock()
-	if hasStagedChallengeResponse {
+	authentication := c.options.Authentication
+	if authentication.StaticChallenge == "" {
+		c.stageCredentials(authentication.Username, authentication.Password, false)
 		return nil
 	}
-	authentication := c.options.Authentication
-	needCredentials := authentication.StaticChallenge != "" &&
-		authentication.Username == "" && authentication.Password == "" &&
-		!hasInteractiveUserPass
-	needSecret := authentication.StaticChallenge != "" &&
-		!hasInteractiveSecret
-	if needCredentials {
-		challenge := Challenge{
-			Kind:     ChallengeCredentials,
-			Username: authentication.Username,
-		}
-		if needSecret {
-			challenge.SecretMessage = authentication.StaticChallenge
-			challenge.Echo = authentication.StaticChallengeEcho
-		}
-		response, err := c.awaitChallengeResponse(ctx, challenge)
+	username := authentication.Username
+	password := authentication.Password
+	var response ChallengeResponse
+	var err error
+	if username == "" && password == "" {
+		response, err = c.awaitChallengeResponse(ctx, Challenge{
+			Kind:          ChallengeCredentials,
+			Username:      authentication.Username,
+			SecretMessage: authentication.StaticChallenge,
+			Echo:          authentication.StaticChallengeEcho,
+		})
 		if err != nil {
 			return err
 		}
-		c.setInteractiveUserPass(response.Username, response.Password)
-		if needSecret {
-			c.setInteractiveSecret(response.Secret)
-		}
-		return nil
-	}
-	if needSecret {
-		response, err := c.awaitChallengeResponse(ctx, Challenge{
+		username = response.Username
+		password = response.Password
+	} else {
+		response, err = c.awaitChallengeResponse(ctx, Challenge{
 			Kind:     ChallengeSecret,
 			Username: authentication.Username,
 			Message:  authentication.StaticChallenge,
@@ -158,14 +149,23 @@ func (c *Client) acquireInteractiveCredentials(ctx context.Context, useActiveAut
 		if err != nil {
 			return err
 		}
-		c.setInteractiveSecret(response.Secret)
 	}
+	// Upstream get_user_pass_cr (misc.c) packs static challenge answers as
+	// SCRV1:<base64 password>:<base64 answer>.
+	encodedPassword := base64.StdEncoding.EncodeToString([]byte(password))
+	encodedResponse := base64.StdEncoding.EncodeToString([]byte(response.Secret))
+	c.stageCredentials(username, "SCRV1:"+encodedPassword+":"+encodedResponse, true)
 	return nil
 }
 
 func (c *Client) interceptAuthChallenge(ctx context.Context, sessionErr error) (bool, error) {
 	challengeErr, isChallenge := E.Cast[*AuthChallengeError](sessionErr)
 	if isChallenge {
+		// Upstream receive_auth_failed (push.c) purges auth_user_pass before it
+		// stores the challenge, so the next auth_user_pass_setup asks for the
+		// answer instead of reusing the rejected credentials.
+		rejected := c.loadStagedCredentials()
+		c.purgeStagedCredentials()
 		if c.lastSentCredentialsInteractive() {
 			c.notePreviousAuthFailure(ErrAuthenticationFailed.Error())
 		}
@@ -178,10 +178,15 @@ func (c *Client) interceptAuthChallenge(ctx context.Context, sessionErr error) (
 		if err != nil {
 			return false, err
 		}
-		c.setChallengeResponseCredentials(
-			challengeErr.Challenge.Username,
-			// Upstream get_user_pass (misc.c) packs dynamic challenge answers as CRV1::<state_id>::<response>.
+		username := challengeErr.Challenge.Username
+		if username == "" {
+			username = rejected.username
+		}
+		c.stageCredentials(
+			username,
+			// Upstream get_user_pass_cr (misc.c) packs dynamic challenge answers as CRV1::<state_id>::<response>.
 			"CRV1::"+challengeErr.Challenge.StateID+"::"+response.Secret,
+			true,
 		)
 		return true, nil
 	}
@@ -199,7 +204,7 @@ func (c *Client) interceptAuthChallenge(ctx context.Context, sessionErr error) (
 	if !c.lastSentCredentialsInteractive() {
 		return false, nil
 	}
-	c.clearInteractiveCredentials()
+	c.purgeStagedCredentials()
 	c.notePreviousAuthFailure(interactiveAuthFailureReason(sessionErr))
 	return true, nil
 }
@@ -222,7 +227,7 @@ func (c *Client) runSupervisor(ctx context.Context) {
 		if ctx.Err() != nil || c.isClosed() {
 			return
 		}
-		err := c.acquireInteractiveCredentials(ctx, !firstSession)
+		err := c.acquireSessionCredentials(ctx, !firstSession)
 		if err != nil {
 			if ctx.Err() != nil || c.isClosed() {
 				return
@@ -384,8 +389,9 @@ func (c *Client) resetSessionConfiguration(remote clientRemote) {
 	c.tunnel.deferInitialEvent = false
 	c.tunnel.pullFilterRejection = ""
 	c.tunnel.compressionPushRejection = ""
-	c.dataPlane.framing.Store(newDataChannelFraming(c.options, c.dataPlane.allowCompressionPolicy))
+	c.dataPlane.framing.Store(newDataChannelFraming(c.dataPlane.compression, c.options.DataChannel.Fragment, c.dataPlane.allowCompressionPolicy))
 	c.dataPlane.incomingPacketDropLog.Reset()
+	c.dataPlane.outgoingPacketDropLog.Reset()
 	c.tunnel.access.Unlock()
 }
 

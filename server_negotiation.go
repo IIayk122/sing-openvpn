@@ -35,15 +35,25 @@ func tlsServerCipher(peerInfo string, optionsString string, options ServerOption
 	return "", E.Extend(ErrCipherNegotiationFailed, "no shared cipher")
 }
 
+// Upstream tls_peer_ncp_list (ssl_ncp.c) answers IV_CIPHERS when the peer sent
+// it and otherwise reads IV_NCP=2 as the two GCM ciphers.
 func parsePeerInfoCipherList(peerInfo string) ([]string, bool) {
+	ciphers, announced := peerInfoIVCipherList(peerInfo)
+	if announced {
+		return ciphers, true
+	}
+	if peerInfoNCPVersion(peerInfo) >= 2 {
+		return []string{"AES-256-GCM", "AES-128-GCM"}, true
+	}
+	return nil, false
+}
+
+func peerInfoIVCipherList(peerInfo string) ([]string, bool) {
 	for line := range strings.SplitSeq(peerInfo, "\n") {
 		if !strings.HasPrefix(line, "IV_CIPHERS=") {
 			continue
 		}
 		return splitPeerInfoCipherList(strings.TrimPrefix(line, "IV_CIPHERS=")), true
-	}
-	if peerInfoNCPVersion(peerInfo) >= 2 {
-		return []string{"AES-256-GCM", "AES-128-GCM"}, true
 	}
 	return nil, false
 }
@@ -81,29 +91,27 @@ const (
 	serverPushSafeCapacity   = serverPushBundleSize - serverPushBundleOverhead
 )
 
-func buildServerPushReplyPayloadsWithOverrides(options ServerOptions, peerInfo string, selectedCipher string, peerID *uint32, ifconfigOverride pushedLocalAddress, ifconfigIPv6Override pushedLocalAddress, serverIPv4 netip.Addr) ([][]byte, error) {
+func buildServerPushReplyPayloads(options ServerOptions, peerInfo string, selectedCipher string, assignment serverPushAssignment) ([][]byte, error) {
 	serverPushOptions := buildPushedOptions(options)
 	if _, supportsPushMTU := peerInfoMTU(peerInfo); !supportsPushMTU {
 		serverPushOptions.TunMTU = 0
 	}
-	if ifconfigOverride.Prefix.IsValid() {
-		serverPushOptions.LocalAddress = replacePushedLocalAddressByFamily(serverPushOptions.LocalAddress, ifconfigOverride)
+	if assignment.LocalAddressIPv4.Prefix.IsValid() {
+		serverPushOptions.LocalAddress = replacePushedLocalAddressByFamily(serverPushOptions.LocalAddress, assignment.LocalAddressIPv4)
 	}
-	if ifconfigIPv6Override.Prefix.IsValid() {
-		serverPushOptions.LocalAddress = replacePushedLocalAddressByFamily(serverPushOptions.LocalAddress, ifconfigIPv6Override)
+	if assignment.LocalAddressIPv6.Prefix.IsValid() {
+		serverPushOptions.LocalAddress = replacePushedLocalAddressByFamily(serverPushOptions.LocalAddress, assignment.LocalAddressIPv6)
 	}
-	if serverIPv4.Is4() {
-		topology, topologyErr := resolveIPv4PoolTopology(options.Tunnel.Topology)
-		if topologyErr == nil {
-			switch topology {
-			case ipv4TopologySubnet:
-				if !serverPushOptions.RouteGateway.IsValid() && !serverPushOptions.RouteGatewayVPN && serverPushOptions.RouteGatewayRaw == "" {
-					serverPushOptions.RouteGateway = serverIPv4
-				}
-			case ipv4TopologyNet30:
-				serverRoute := TunnelRoute{Prefix: netip.PrefixFrom(serverIPv4, 32)}
-				serverPushOptions.Routes = appendUniquePushedRoutes(serverPushOptions.Routes, serverRoute)
+	if assignment.IPv4Topology != "" {
+		serverPushOptions.Topology = assignment.IPv4Topology
+		switch assignment.IPv4Topology {
+		case ipv4TopologySubnet:
+			if !serverPushOptions.RouteGateway.IsValid() && !serverPushOptions.RouteGatewayVPN && serverPushOptions.RouteGatewayRaw == "" {
+				serverPushOptions.RouteGateway = assignment.ServerIPv4
 			}
+		case ipv4TopologyNet30:
+			serverRoute := TunnelRoute{Prefix: netip.PrefixFrom(assignment.ServerIPv4, 32)}
+			serverPushOptions.Routes = appendUniquePushedRoutes(serverPushOptions.Routes, serverRoute)
 		}
 	}
 	fields := buildPushReplyOptionFields(serverPushOptions)
@@ -111,8 +119,8 @@ func buildServerPushReplyPayloadsWithOverrides(options ServerOptions, peerInfo s
 	if selectedCipher != "" && (hasCipherList || peerInfoNCPVersion(peerInfo) >= 2) {
 		fields = append(fields, "cipher "+selectedCipher)
 	}
-	if peerID != nil && peerSupportsIVProtoFlag(peerInfo, tlsIVProtoDataV2) {
-		fields = append(fields, "peer-id "+strconv.FormatUint(uint64(*peerID), 10))
+	if assignment.PeerID != nil && peerSupportsIVProtoFlag(peerInfo, tlsIVProtoDataV2) {
+		fields = append(fields, "peer-id "+strconv.FormatUint(uint64(*assignment.PeerID), 10))
 	}
 	supportsCCExit := peerSupportsIVProtoFlag(peerInfo, tlsIVProtoCCExitNotify)
 	supportsTLSKeyExport := peerSupportsIVProtoFlag(peerInfo, tlsIVProtoTLSKeyExport)

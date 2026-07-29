@@ -48,6 +48,7 @@ const (
 )
 
 func TestRemoteCertificateUsageIntegration(t *testing.T) {
+	t.Parallel()
 	rsaAuthority := generateRSASigner(t, 2048)
 	t.Run("missing_key_usage_rejected_by_shorthand", func(t *testing.T) {
 		material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
@@ -100,12 +101,29 @@ func TestRemoteCertificateUsageIntegration(t *testing.T) {
 			serverKey:                  generateRSASigner(t, 2048),
 			serverSignature:            x509.SHA256WithRSA,
 			serverKeyUsage:             x509.KeyUsageDigitalSignature,
+			serverExtendedKeyUsage:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 			serverUnknownExtendedUsage: []asn1.ObjectIdentifier{customUsage},
 		})
 		runCertificateVerificationSession(t, material,
 			openvpn.ClientTLSOptions{RemoteCertificateEKU: customUsage.String()},
 			openvpn.ServerTLSOptions{VerifyClientCertificate: "none"},
 			certificateVerificationAccepted,
+		)
+	})
+	t.Run("extended_key_usage_without_server_purpose_rejected", func(t *testing.T) {
+		customUsage := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 55555, 7}
+		material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
+			authorityKey:               rsaAuthority,
+			authoritySignature:         x509.SHA256WithRSA,
+			serverKey:                  generateRSASigner(t, 2048),
+			serverSignature:            x509.SHA256WithRSA,
+			serverKeyUsage:             x509.KeyUsageDigitalSignature,
+			serverUnknownExtendedUsage: []asn1.ObjectIdentifier{customUsage},
+		})
+		runCertificateVerificationSession(t, material,
+			openvpn.ClientTLSOptions{RemoteCertificateEKU: customUsage.String()},
+			openvpn.ServerTLSOptions{VerifyClientCertificate: "none"},
+			certificateVerificationRejectedByClient,
 		)
 	})
 	t.Run("openssl_extended_key_usage_name", func(t *testing.T) {
@@ -126,6 +144,7 @@ func TestRemoteCertificateUsageIntegration(t *testing.T) {
 }
 
 func TestCertificateProfileIntegration(t *testing.T) {
+	t.Parallel()
 	rsaAuthority := generateRSASigner(t, 2048)
 	sha1Material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
 		authorityKey:           rsaAuthority,
@@ -238,6 +257,7 @@ func TestCertificateProfileIntegration(t *testing.T) {
 }
 
 func TestServerCertificateProfileIntegration(t *testing.T) {
+	t.Parallel()
 	rsaAuthority := generateRSASigner(t, 2048)
 	material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
 		authorityKey:           rsaAuthority,
@@ -290,6 +310,7 @@ func TestServerCertificateProfileIntegration(t *testing.T) {
 }
 
 func TestVerifyClientCertificateModesWithoutClientCertificate(t *testing.T) {
+	t.Parallel()
 	rsaAuthority := generateRSASigner(t, 2048)
 	material := createCertificateVerificationMaterial(t, certificateVerificationParameters{
 		authorityKey:           rsaAuthority,

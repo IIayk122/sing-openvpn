@@ -79,8 +79,13 @@ func (o Opcode) IsData() bool {
 	}
 }
 
+const (
+	SessionIDLength = 8
+	PacketIDLength  = 4
+)
+
 type (
-	SessionID [8]byte
+	SessionID [SessionIDLength]byte
 	PacketID  uint32
 	PeerID    [3]byte
 )

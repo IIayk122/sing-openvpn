@@ -4,19 +4,11 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
-
-	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type dataChannelFraming struct {
-	compressionLZO             bool
-	compressionLZOOutbound     bool
-	compressionLZOAdaptive     bool
-	compressionLZODecompress   bool
-	compressionStub            bool
-	compressionV2Stub          bool
-	compressionLZ4V1           bool
-	compressionLZ4V2           bool
+	compression                compressionSettings
+	compressOutbound           bool
 	fragmentSize               int
 	lzoAdaptiveDisabled        bool
 	lzoAdaptiveNext            time.Time
@@ -34,31 +26,14 @@ type dataChannelFraming struct {
 	reassemblyMaxPacketBytes int
 }
 
-func newDataChannelFraming(options ClientOptions, allowCompression allowCompressionPolicy) *dataChannelFraming {
-	compressionLZO := isLZOCompressionEnabled(options.DataChannel.Compression, options.DataChannel.CompressionLZO)
-	compressionLZOName := options.DataChannel.CompressionLZO
-	// Upstream compv2_stub_alg / COMP_ALG_LZ4 / COMP_ALGV2_LZ4 define
-	// the V2 framing and LZ4 subtype behavior.
-	compressionName := options.DataChannel.Compression
-	// Upstream options_postprocess_compression maps compress stub to
-	// COMP_ALG_STUB | COMP_F_SWAP, using compstub swap framing.
-	compressionStub := compressionName == "stub"
-	compressionV2Stub := compressionName == "stub-v2"
-	compressionLZ4V1 := compressionName == "lz4"
-	compressionLZ4V2 := compressionName == "lz4-v2"
-	fragmentSize := int(options.DataChannel.Fragment)
-	if !compressionLZO && !compressionStub && !compressionV2Stub && !compressionLZ4V1 && !compressionLZ4V2 && fragmentSize <= 0 {
+func newDataChannelFraming(compression compressionSettings, fragment uint32, allowCompression allowCompressionPolicy) *dataChannelFraming {
+	fragmentSize := int(fragment)
+	if !compression.framingEnabled() && fragmentSize <= 0 {
 		return nil
 	}
 	return &dataChannelFraming{
-		compressionLZO:           compressionLZO,
-		compressionLZOOutbound:   allowCompression == allowCompressionYes && (compressionLZOName == "yes" || compressionLZOName == "adaptive"),
-		compressionLZOAdaptive:   compressionLZOName == "adaptive",
-		compressionLZODecompress: compressionLZOName == "yes" || compressionLZOName == "adaptive" || compressionLZOName == "asym",
-		compressionStub:          compressionStub,
-		compressionV2Stub:        compressionV2Stub,
-		compressionLZ4V1:         compressionLZ4V1,
-		compressionLZ4V2:         compressionLZ4V2,
+		compression:              compression,
+		compressOutbound:         compression.compressesOutbound(allowCompression),
 		fragmentSize:             fragmentSize,
 		outgoingSequence:         int(rand.Uint32() & openVPNFragmentSequenceMask),
 		incomingBySequence:       make(map[int]*incomingFragmentBuffer),
@@ -72,10 +47,7 @@ func (f *dataChannelFraming) payloadOverhead() int {
 	if f == nil {
 		return 0
 	}
-	overhead := 0
-	if f.compressionLZO || f.compressionStub || f.compressionLZ4V1 {
-		overhead++
-	}
+	overhead := f.compression.framingOverhead()
 	if f.fragmentSize > 0 {
 		overhead += 4
 	}
@@ -88,12 +60,16 @@ func (f *dataChannelFraming) Encode(payload []byte, fragmentSize int) ([][]byte,
 	}
 
 	framedPayload := append([]byte{}, payload...)
-	switch {
-	case f.compressionStub, f.compressionLZ4V1:
-		framedPayload = applyLZ4V1NoCompressFrame(framedPayload)
-	case f.compressionLZO:
+	switch f.compression.algorithm {
+	case compressionAlgorithmStub:
+		framedPayload = applyStubCompressionFrame(framedPayload, f.compression.swap)
+	case compressionAlgorithmLZ4:
+		// Upstream lz4_compress emits the swapped no-compress stub when the
+		// payload is not compressed.
+		framedPayload = applyStubCompressionFrame(framedPayload, true)
+	case compressionAlgorithmLZO:
 		framedPayload = f.encodeLZOFrame(framedPayload)
-	case f.compressionLZ4V2, f.compressionV2Stub:
+	case compressionAlgorithmStubV2, compressionAlgorithmLZ4V2:
 		framedPayload = escapeV2StubCompression(framedPayload)
 	}
 
@@ -117,49 +93,29 @@ func (f *dataChannelFraming) Decode(payload []byte) ([]byte, bool, error) {
 		framedPayload = reassembledPayload
 	}
 
-	if f.compressionStub {
-		if len(framedPayload) == 0 {
-			return nil, false, E.New("missing compression marker")
+	switch f.compression.algorithm {
+	case compressionAlgorithmStub:
+		unframedPayload, err := unframeStubCompression(framedPayload, f.compression.swap)
+		if err != nil {
+			return nil, false, err
 		}
-		// Upstream stub_decompress under COMP_F_SWAP accepts only 0xFB.
-		if framedPayload[0] != openVPNNoCompressByteSwap {
-			return nil, false, E.New("invalid compression stub marker")
+		framedPayload = unframedPayload
+	case compressionAlgorithmLZO:
+		unframedPayload, err := decodeLZOFrame(framedPayload)
+		if err != nil {
+			return nil, false, err
 		}
-		framedPayload = unswapV1FrameHead(framedPayload)
-	} else if f.compressionLZO || f.compressionLZ4V1 {
-		if len(framedPayload) == 0 {
-			return nil, false, E.New("missing compression marker")
+		framedPayload = unframedPayload
+	case compressionAlgorithmLZ4:
+		unframedPayload, err := decodeLZ4V1Frame(framedPayload)
+		if err != nil {
+			return nil, false, err
 		}
-		switch framedPayload[0] {
-		case openVPNNoCompressByte:
-			framedPayload = framedPayload[1:]
-		case openVPNNoCompressByteSwap:
-			framedPayload = unswapV1FrameHead(framedPayload)
-		case openVPNLZOCompressByte:
-			if !f.compressionLZODecompress {
-				return nil, false, E.New("compressed lzo payload is not supported")
-			}
-			decompressedPayload, decompressErr := decompressLZOBlock(framedPayload[1:])
-			if decompressErr != nil {
-				return nil, false, decompressErr
-			}
-			framedPayload = decompressedPayload
-		case openVPNLZ4CompressByte:
-			if !f.compressionLZ4V1 {
-				return nil, false, E.New("compressed lz4 payload is not supported")
-			}
-			decompressedPayload, decompressErr := decompressLZ4V1Frame(framedPayload)
-			if decompressErr != nil {
-				return nil, false, decompressErr
-			}
-			framedPayload = decompressedPayload
-		default:
-			return nil, false, E.New("invalid compression marker")
-		}
-	} else if f.compressionV2Stub || f.compressionLZ4V2 {
-		unwrappedPayload, unwrapErr := f.unwrapV2Compression(framedPayload)
-		if unwrapErr != nil {
-			return nil, false, unwrapErr
+		framedPayload = unframedPayload
+	case compressionAlgorithmStubV2, compressionAlgorithmLZ4V2:
+		unwrappedPayload, err := f.unwrapV2Compression(framedPayload)
+		if err != nil {
+			return nil, false, err
 		}
 		framedPayload = unwrappedPayload
 	}

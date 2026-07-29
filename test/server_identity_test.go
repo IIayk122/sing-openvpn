@@ -11,6 +11,7 @@ import (
 )
 
 func TestTLSServerDuplicateCNReplacementKeepsTunnelAddress(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "tcp")
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelServerContext()

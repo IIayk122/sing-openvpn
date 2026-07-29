@@ -6,35 +6,31 @@ import (
 )
 
 const (
-	defaultServerMaxClients                  = 1024
-	defaultServerMaxPendingHandshakes        = 100
-	defaultServerInitialPacketRate           = 1000
-	defaultServerInitialConnectionRate       = 100
-	defaultServerInitialConnectionRatePeriod = 10 * time.Second
+	defaultServerMaxClients                    = 1024
+	defaultServerInitialConnectFrequency       = 100
+	defaultServerInitialConnectFrequencyPeriod = 10 * time.Second
 )
 
 type serverResourcePolicy struct {
 	access sync.Mutex
 
-	maxClients              int
-	maxPendingHandshakes    int
-	initialPacketRate       int
-	initialConnectionRate   int
-	initialConnectionPeriod time.Duration
+	maxClients int
 
-	activeAndPending        int
-	pending                 int
-	windowStart             time.Time
-	windowAttempts          int
-	packetWindowStart       time.Time
-	packetWindowAttempts    int
-	challengeWindowStart    time.Time
-	challengeWindowAttempts int
+	connectFrequency       int
+	connectFrequencyPeriod time.Duration
+	connectWindowStart     time.Time
+	connectWindowCount     int
+
+	initialConnectFrequency       int
+	initialConnectFrequencyPeriod time.Duration
+	initialWindowStart            time.Time
+	initialWindowCount            int
+
+	instances int
 }
 
 type serverResourceReservation struct {
-	policy      *serverResourcePolicy
-	established bool
+	policy *serverResourcePolicy
 }
 
 func newServerResourcePolicy(options ServerOptions) *serverResourcePolicy {
@@ -42,73 +38,66 @@ func newServerResourcePolicy(options ServerOptions) *serverResourcePolicy {
 	if maxClients == 0 {
 		maxClients = defaultServerMaxClients
 	}
-	maxPendingHandshakes := min(defaultServerMaxPendingHandshakes, maxClients)
-	initialConnectionRate := defaultServerInitialConnectionRate
-	initialPacketRate := defaultServerInitialPacketRate
-	initialConnectionPeriod := defaultServerInitialConnectionRatePeriod
+	initialConnectFrequency := options.Resources.InitialConnectFrequency
+	initialConnectFrequencyPeriod := options.Resources.InitialConnectFrequencyPeriod
+	if initialConnectFrequencyPeriod == 0 {
+		initialConnectFrequency = defaultServerInitialConnectFrequency
+		initialConnectFrequencyPeriod = defaultServerInitialConnectFrequencyPeriod
+	}
 	return &serverResourcePolicy{
-		maxClients:              maxClients,
-		maxPendingHandshakes:    maxPendingHandshakes,
-		initialPacketRate:       initialPacketRate,
-		initialConnectionRate:   initialConnectionRate,
-		initialConnectionPeriod: initialConnectionPeriod,
+		maxClients:                    maxClients,
+		connectFrequency:              options.Resources.ConnectFrequency,
+		connectFrequencyPeriod:        options.Resources.ConnectFrequencyPeriod,
+		initialConnectFrequency:       initialConnectFrequency,
+		initialConnectFrequencyPeriod: initialConnectFrequencyPeriod,
 	}
 }
 
 func (p *serverResourcePolicy) allowInitialPacket(now time.Time) bool {
 	p.access.Lock()
 	defer p.access.Unlock()
-	if p.packetWindowStart.IsZero() || now.Before(p.packetWindowStart) || now.Sub(p.packetWindowStart) >= p.initialConnectionPeriod {
-		p.packetWindowStart = now
-		p.packetWindowAttempts = 0
+	if p.initialWindowStart.IsZero() || now.Sub(p.initialWindowStart) > p.initialConnectFrequencyPeriod {
+		p.initialWindowStart = now
+		p.initialWindowCount = 0
 	}
-	p.packetWindowAttempts++
-	return p.packetWindowAttempts <= p.initialPacketRate
+	p.initialWindowCount++
+	return p.initialWindowCount <= p.initialConnectFrequency
 }
 
-func (p *serverResourcePolicy) allowInitialChallenge(now time.Time) bool {
+func (p *serverResourcePolicy) refundInitialPacket() {
 	p.access.Lock()
 	defer p.access.Unlock()
-	if p.challengeWindowStart.IsZero() || now.Before(p.challengeWindowStart) || now.Sub(p.challengeWindowStart) >= p.initialConnectionPeriod {
-		p.challengeWindowStart = now
-		p.challengeWindowAttempts = 0
+	if p.initialWindowCount > 0 {
+		p.initialWindowCount--
 	}
-	p.challengeWindowAttempts++
-	return p.challengeWindowAttempts <= p.initialConnectionRate
 }
 
-func (p *serverResourcePolicy) reserve(now time.Time) *serverResourceReservation {
+func (p *serverResourcePolicy) allowNewConnection(now time.Time) bool {
 	p.access.Lock()
 	defer p.access.Unlock()
-	if p.windowStart.IsZero() || now.Before(p.windowStart) || now.Sub(p.windowStart) >= p.initialConnectionPeriod {
-		p.windowStart = now
-		p.windowAttempts = 0
+	if p.connectFrequencyPeriod == 0 {
+		return true
 	}
-	p.windowAttempts++
-	if p.windowAttempts > p.initialConnectionRate ||
-		p.activeAndPending >= p.maxClients ||
-		p.pending >= p.maxPendingHandshakes {
+	if p.connectWindowStart.IsZero() || now.Sub(p.connectWindowStart) >= p.connectFrequencyPeriod {
+		p.connectWindowStart = now
+		p.connectWindowCount = 0
+	}
+	p.connectWindowCount++
+	return p.connectWindowCount <= p.connectFrequency
+}
+
+func (p *serverResourcePolicy) reserveInstance() *serverResourceReservation {
+	p.access.Lock()
+	defer p.access.Unlock()
+	if p.instances >= p.maxClients {
 		return nil
 	}
-	p.activeAndPending++
-	p.pending++
-	return &serverResourceReservation{
-		policy: p,
-	}
-}
-
-func (r *serverResourceReservation) establish() {
-	r.policy.access.Lock()
-	r.policy.pending--
-	r.policy.access.Unlock()
-	r.established = true
+	p.instances++
+	return &serverResourceReservation{policy: p}
 }
 
 func (r *serverResourceReservation) release() {
 	r.policy.access.Lock()
-	r.policy.activeAndPending--
-	if !r.established {
-		r.policy.pending--
-	}
+	r.policy.instances--
 	r.policy.access.Unlock()
 }

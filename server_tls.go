@@ -15,7 +15,6 @@ import (
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
-	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -23,28 +22,31 @@ type tlsServer struct {
 	parent              *Server
 	tlsConfiguration    *tls.Config
 	staticProtection    tlsControlProtection
-	tlsCryptV2Server    []byte
 	sessionAccess       sync.RWMutex
 	sessionByPeer       map[string]*tlsServerSession
 	sessionByIdentity   map[string]*tlsServerSession
 	sessionByPeerID     map[uint32]*tlsServerSession
 	udpSessionByAddress map[string]*tlsServerSession
-	loopContext         context.Context
-	cancelLoop          context.CancelFunc
-	loopWaitGroup       sync.WaitGroup
-	lifecycleAccess     sync.Mutex
-	lifecycleState      serverLifecycleState
-	closeDone           chan struct{}
-	closeErr            error
-	streamListener      net.Listener
-	packetListener      net.PacketConn
-	packetBatchReader   N.PacketBatchReadWaiter
-	packetWriter        *udpPacketWriter
-	resourcePolicy      *serverResourcePolicy
-	peerIDCounter       uint32
-	sessionCounter      uint64
-	droppedUDPPackets   atomic.Uint64
-	sessionIDHMACSigner *sessionIDHMACSigner
+	// Upstream keeps TM_ACTIVE and TM_INITIAL side by side inside the instance
+	// which owns a source address, so a peer negotiating a new session on an
+	// address already carrying a tunnel does not disturb that tunnel.
+	udpInitialSessionByAddress map[string]*tlsServerSession
+	loopContext                context.Context
+	cancelLoop                 context.CancelFunc
+	loopWaitGroup              sync.WaitGroup
+	lifecycleAccess            sync.Mutex
+	lifecycleState             serverLifecycleState
+	listenerStopped            bool
+	closeDone                  chan struct{}
+	closeErr                   error
+	streamListener             net.Listener
+	packetListener             net.PacketConn
+	packetBatchReader          N.PacketBatchReadWaiter
+	packetWriter               *udpPacketWriter
+	resourcePolicy             *serverResourcePolicy
+	sessionCounter             uint64
+	droppedUDPPackets          atomic.Uint64
+	sessionIDHMACSigner        *sessionIDHMACSigner
 }
 
 func newTLSServer(parent *Server) (*tlsServer, error) {
@@ -52,7 +54,7 @@ func newTLSServer(parent *Server) (*tlsServer, error) {
 	if err != nil {
 		return nil, err
 	}
-	staticProtection, tlsCryptV2Server, err := newTLSServerProtection(parent.options)
+	staticProtection, err := newTLSServerProtection(parent.options)
 	if err != nil {
 		return nil, err
 	}
@@ -61,34 +63,34 @@ func newTLSServer(parent *Server) (*tlsServer, error) {
 		return nil, err
 	}
 	return &tlsServer{
-		parent:              parent,
-		tlsConfiguration:    tlsConfiguration,
-		staticProtection:    staticProtection,
-		tlsCryptV2Server:    tlsCryptV2Server,
-		sessionByPeer:       make(map[string]*tlsServerSession),
-		sessionByIdentity:   make(map[string]*tlsServerSession),
-		sessionByPeerID:     make(map[uint32]*tlsServerSession),
-		udpSessionByAddress: make(map[string]*tlsServerSession),
-		resourcePolicy:      newServerResourcePolicy(parent.options),
-		closeDone:           make(chan struct{}),
-		sessionIDHMACSigner: sessionIDHMACSignerInstance,
+		parent:                     parent,
+		tlsConfiguration:           tlsConfiguration,
+		staticProtection:           staticProtection,
+		sessionByPeer:              make(map[string]*tlsServerSession),
+		sessionByIdentity:          make(map[string]*tlsServerSession),
+		sessionByPeerID:            make(map[uint32]*tlsServerSession),
+		udpSessionByAddress:        make(map[string]*tlsServerSession),
+		udpInitialSessionByAddress: make(map[string]*tlsServerSession),
+		resourcePolicy:             newServerResourcePolicy(parent.options),
+		closeDone:                  make(chan struct{}),
+		sessionIDHMACSigner:        sessionIDHMACSignerInstance,
 	}, nil
 }
 
-func newTLSServerProtection(options ServerOptions) (tlsControlProtection, []byte, error) {
+func newTLSServerProtection(options ServerOptions) (tlsControlProtection, error) {
 	switch {
 	case options.TLS.CryptV2.IsSet():
 		serverKey, err := loadTLSCryptV2ServerKey(options.TLS.CryptV2)
 		if err != nil {
-			return tlsControlProtection{}, nil, err
+			return tlsControlProtection{}, err
 		}
-		return tlsControlProtection{}, serverKey, nil
+		return tlsControlProtection{cryptV2ServerKey: serverKey}, nil
 	case options.TLS.Crypt.IsSet():
 		cryptCodec, err := newControlCryptCodec(options.TLS.Crypt, tlsCryptKeyDirectionNormal)
 		if err != nil {
-			return tlsControlProtection{}, nil, err
+			return tlsControlProtection{}, err
 		}
-		return tlsControlProtection{crypt: cryptCodec}, nil, nil
+		return tlsControlProtection{crypt: cryptCodec}, nil
 	case options.TLS.Auth.IsSet():
 		authName := options.DataChannel.Auth
 		if authName == "" || authName == "NONE" {
@@ -96,11 +98,11 @@ func newTLSServerProtection(options ServerOptions) (tlsControlProtection, []byte
 		}
 		authCodec, err := newControlAuthCodecWithAuth(options.TLS.Auth, options.KeyDirection, authName)
 		if err != nil {
-			return tlsControlProtection{}, nil, err
+			return tlsControlProtection{}, err
 		}
-		return tlsControlProtection{auth: authCodec}, nil, nil
+		return tlsControlProtection{auth: authCodec}, nil
 	default:
-		return tlsControlProtection{}, nil, nil
+		return tlsControlProtection{}, nil
 	}
 }
 
@@ -263,36 +265,7 @@ func (s *tlsServer) WriteDataPacketBuffers(peerAddress string, payloads []*buf.B
 func (s *tlsServer) isRunning() bool {
 	s.lifecycleAccess.Lock()
 	defer s.lifecycleAccess.Unlock()
-	return s.lifecycleState == serverLifecycleRunning
-}
-
-func (s *tlsServer) runStreamAcceptLoop() {
-	defer s.loopWaitGroup.Done()
-	for {
-		streamConnection, err := s.streamListener.Accept()
-		if err != nil {
-			select {
-			case <-s.loopContext.Done():
-				return
-			default:
-			}
-			if E.IsTimeout(err) {
-				continue
-			}
-			return
-		}
-		reservation := s.resourcePolicy.reserve(time.Now())
-		if reservation == nil {
-			_ = streamConnection.Close()
-			continue
-		}
-		if !s.reserveLoopWorker() {
-			reservation.release()
-			_ = streamConnection.Close()
-			return
-		}
-		go s.runStreamSession(streamConnection, reservation)
-	}
+	return s.lifecycleState == serverLifecycleRunning && !s.listenerStopped
 }
 
 func (s *tlsServer) reserveLoopWorker() bool {
@@ -303,185 +276,6 @@ func (s *tlsServer) reserveLoopWorker() bool {
 	}
 	s.loopWaitGroup.Add(1)
 	return true
-}
-
-func (s *tlsServer) runStreamSession(streamConnection net.Conn, reservation *serverResourceReservation) {
-	defer s.loopWaitGroup.Done()
-	defer reservation.release()
-	packetConnection, err := proto.NewPacketConnection(streamConnection, s.parent.protocol)
-	if err != nil {
-		_ = streamConnection.Close()
-		return
-	}
-	peerAddress := streamConnection.RemoteAddr().String()
-	session := s.newSession(packetConnection, reservation)
-	defer session.finish()
-	err = s.registerSession(peerAddress, session, nil)
-	if err != nil {
-		return
-	}
-	defer s.unregisterSession(session)
-	clientResetPacket, protection, err := session.readClientReset(nil)
-	if err != nil {
-		return
-	}
-	err = session.runWithClientReset(clientResetPacket, protection)
-	session.logTermination(err)
-}
-
-func (s *tlsServer) runPacketLoop() {
-	defer s.loopWaitGroup.Done()
-	readBuffer := make([]byte, math.MaxUint16)
-	for {
-		select {
-		case <-s.loopContext.Done():
-			return
-		default:
-		}
-		err := s.packetListener.SetReadDeadline(time.Now().Add(time.Second))
-		if err != nil {
-			return
-		}
-		var rawPacketBuffers []*buf.Buffer
-		var remoteAddresses []net.Addr
-		var readErr error
-		if s.packetBatchReader != nil {
-			var destinations []M.Socksaddr
-			rawPacketBuffers, destinations, readErr = s.packetBatchReader.WaitReadPackets()
-			if len(rawPacketBuffers) != len(destinations) {
-				buf.ReleaseMulti(rawPacketBuffers)
-				return
-			}
-			remoteAddresses = make([]net.Addr, len(destinations))
-			for i, destination := range destinations {
-				remoteAddresses[i] = destination.UDPAddr()
-			}
-		} else {
-			var readCount int
-			var remoteAddress net.Addr
-			readCount, remoteAddress, readErr = s.packetListener.ReadFrom(readBuffer)
-			if readCount > 0 {
-				rawPacket := append([]byte{}, readBuffer[:readCount]...)
-				rawPacketBuffers = []*buf.Buffer{buf.As(rawPacket)}
-				remoteAddresses = []net.Addr{remoteAddress}
-			}
-		}
-		peerAddresses := make([]string, len(remoteAddresses))
-		for i, remoteAddress := range remoteAddresses {
-			peerAddresses[i] = remoteAddress.String()
-		}
-		candidateSessions := s.findUDPSessions(rawPacketBuffers, peerAddresses)
-		sessionsChanged := false
-		queuedPackets := make(map[*udpPeerPacketConnection][]udpPeerPacket)
-		queuedPacketConnections := make([]*udpPeerPacketConnection, 0, len(rawPacketBuffers))
-		for rawPacketIndex, rawPacketBuffer := range rawPacketBuffers {
-			rawPacket := rawPacketBuffer.Bytes()
-			remoteAddress := remoteAddresses[rawPacketIndex]
-			peerAddress := peerAddresses[rawPacketIndex]
-			session := candidateSessions[rawPacketIndex]
-			if session == nil && sessionsChanged {
-				session = s.findUDPSession(rawPacket, peerAddress)
-			}
-			if session == nil {
-				if !isPossibleUDPPreDecryptPacket(rawPacket) {
-					continue
-				}
-				now := time.Now()
-				if !s.resourcePolicy.allowInitialPacket(now) {
-					continue
-				}
-				preDecryptResult, parseErr := s.preDecryptUDPPacket(rawPacket, remoteAddress, now)
-				if parseErr != nil {
-					continue
-				}
-				if preDecryptResult.verdict == udpPreDecryptChallenge {
-					if !s.resourcePolicy.allowInitialChallenge(now) {
-						continue
-					}
-					writeErr := s.packetWriter.writePacketTo(preDecryptResult.challenge, remoteAddress)
-					if writeErr != nil {
-						s.droppedUDPPackets.Add(1)
-					}
-					continue
-				}
-				if preDecryptResult.verdict != udpPreDecryptAccept {
-					continue
-				}
-				reservation := s.resourcePolicy.reserve(now)
-				if reservation == nil {
-					continue
-				}
-				peerPacketConnection := &udpPeerPacketConnection{
-					writer:          s.packetWriter,
-					localAddress:    s.packetWriter.listener.LocalAddr(),
-					remoteAddress:   remoteAddress,
-					incomingPackets: newDataPacketQueueWithCapacity[udpPeerPacket](256),
-					closed:          make(chan struct{}),
-				}
-				session = s.newSession(peerPacketConnection, reservation)
-				registerErr := s.registerSession(peerAddress, session, remoteAddress)
-				if registerErr != nil {
-					reservation.release()
-					_ = peerPacketConnection.Close()
-					continue
-				}
-				if !s.reserveLoopWorker() {
-					s.unregisterSession(session)
-					reservation.release()
-					session.finish()
-					continue
-				}
-				sessionsChanged = true
-				go func(runningSession *tlsServerSession, resourceReservation *serverResourceReservation, acceptedPreDecryptResult udpPreDecryptResult) {
-					defer s.loopWaitGroup.Done()
-					defer resourceReservation.release()
-					defer s.unregisterSession(runningSession)
-					defer runningSession.finish()
-					var sessionErr error
-					if acceptedPreDecryptResult.directReset {
-						sessionErr = runningSession.runWithClientReset(
-							acceptedPreDecryptResult.packet,
-							acceptedPreDecryptResult.protection,
-						)
-					} else {
-						sessionErr = runningSession.runWithCookieResponse(
-							acceptedPreDecryptResult.packet,
-							acceptedPreDecryptResult.protection,
-							acceptedPreDecryptResult.serverSessionID,
-						)
-					}
-					runningSession.logTermination(sessionErr)
-				}(session, reservation, preDecryptResult)
-				continue
-			}
-			udpPacketConnection, ok := session.packetConnection.(*udpPeerPacketConnection)
-			if !ok {
-				continue
-			}
-			if _, loaded := queuedPackets[udpPacketConnection]; !loaded {
-				queuedPacketConnections = append(queuedPacketConnections, udpPacketConnection)
-			}
-			queuedPacketBuffer := buf.NewSize(rawPacketBuffer.Len())
-			_, _ = queuedPacketBuffer.Write(rawPacket)
-			queuedPackets[udpPacketConnection] = append(queuedPackets[udpPacketConnection], udpPeerPacket{
-				buffer:        queuedPacketBuffer,
-				remoteAddress: remoteAddress,
-			})
-		}
-		for _, packetConnection := range queuedPacketConnections {
-			dropped := packetConnection.pushPackets(queuedPackets[packetConnection])
-			if dropped > 0 {
-				s.droppedUDPPackets.Add(dropped)
-			}
-		}
-		buf.ReleaseMulti(rawPacketBuffers)
-		if readErr != nil {
-			if E.IsTimeout(readErr) {
-				continue
-			}
-			return
-		}
-	}
 }
 
 func (s *tlsServer) getSession(peerAddress string) *tlsServerSession {
@@ -506,6 +300,42 @@ func (s *tlsServer) registerSession(initialPeerAddress string, session *tlsServe
 			return ErrServerResourceLimit
 		}
 	}
+	s.bindPeerAddressLocked(initialPeerAddress, session)
+	if udpAddress != nil {
+		s.udpSessionByAddress[udpAddress.String()] = session
+	}
+	return nil
+}
+
+// Upstream tls_pre_decrypt negotiates a hard reset which matches no session of
+// the instance serving its source address in that instance's TM_INITIAL slot,
+// which holds one session at a time: the newest reset takes the slot over.  The
+// displaced session is returned so the caller ends it outside the registries.
+func (s *tlsServer) registerInitialSession(initialPeerAddress string, session *tlsServerSession, udpAddress net.Addr) (*tlsServerSession, error) {
+	if session == nil || initialPeerAddress == "" || udpAddress == nil {
+		return nil, ErrPeerNotFound
+	}
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	if s.lifecycleState != serverLifecycleRunning {
+		return nil, ErrServerClosed
+	}
+	s.sessionAccess.Lock()
+	defer s.sessionAccess.Unlock()
+	address := udpAddress.String()
+	displaced := s.udpInitialSessionByAddress[address]
+	if displaced == session {
+		displaced = nil
+	}
+	if displaced != nil {
+		s.evictSessionLocked(displaced)
+	}
+	s.bindPeerAddressLocked(initialPeerAddress, session)
+	s.udpInitialSessionByAddress[address] = session
+	return displaced, nil
+}
+
+func (s *tlsServer) bindPeerAddressLocked(initialPeerAddress string, session *tlsServerSession) {
 	stablePeerAddress := initialPeerAddress
 	if existing := s.sessionByPeer[stablePeerAddress]; existing != nil && existing != session {
 		s.sessionCounter++
@@ -517,10 +347,59 @@ func (s *tlsServer) registerSession(initialPeerAddress string, session *tlsServe
 	}
 	session.peerAddress = stablePeerAddress
 	s.sessionByPeer[stablePeerAddress] = session
-	if udpAddress != nil {
-		s.udpSessionByAddress[udpAddress.String()] = session
+}
+
+// Upstream tls_multi_process moves TM_INITIAL into TM_ACTIVE as soon as its
+// key_state authenticates, usurping the session which served the instance until
+// then; a TM_INITIAL which never gets there expires with its handshake window
+// and the session it would have replaced keeps carrying the tunnel.
+func (s *tlsServer) promoteInitialSession(session *tlsServerSession) error {
+	udpConnection, isUDPPeer := session.packetConnection.(*udpPeerPacketConnection)
+	if !isUDPPeer {
+		return nil
 	}
-	return nil
+	remoteAddress := udpConnection.RemoteAddr()
+	if remoteAddress == nil {
+		return nil
+	}
+	address := remoteAddress.String()
+	s.sessionAccess.Lock()
+	if s.udpInitialSessionByAddress[address] != session {
+		s.sessionAccess.Unlock()
+		return nil
+	}
+	delete(s.udpInitialSessionByAddress, address)
+	displaced := s.udpSessionByAddress[address]
+	if displaced == session {
+		displaced = nil
+	}
+	if displaced != nil {
+		s.evictSessionLocked(displaced)
+		session.resourceReservation.Store(displaced.resourceReservation.Swap(nil))
+	}
+	s.udpSessionByAddress[address] = session
+	s.sessionAccess.Unlock()
+	if session.resourceReservation.Load() == nil {
+		reservation := s.resourcePolicy.reserveInstance()
+		if reservation == nil {
+			return ErrServerResourceLimit
+		}
+		session.resourceReservation.Store(reservation)
+	}
+	if displaced == nil {
+		return nil
+	}
+	_ = displaced.Close()
+	timer := time.NewTimer(serverScheduledExitInterval)
+	defer timer.Stop()
+	select {
+	case <-displaced.finishDone:
+		return nil
+	case <-session.sessionContext.Done():
+		return session.sessionContext.Err()
+	case <-timer.C:
+		return E.New("timed out replacing the OpenVPN session bound to ", address)
+	}
 }
 
 func (s *tlsServer) registerAuthenticatedIdentity(session *tlsServerSession) error {
@@ -528,7 +407,9 @@ func (s *tlsServer) registerAuthenticatedIdentity(session *tlsServerSession) err
 		return ErrPeerNotFound
 	}
 	identity := session.authenticatedIdentityKey()
+	s.sessionAccess.Lock()
 	session.authenticatedIdentity = identity
+	s.sessionAccess.Unlock()
 	if identity == "" || s.parent.options.Authentication.DuplicateCN {
 		return nil
 	}
@@ -599,13 +480,7 @@ func (s *tlsServer) enablePeerID(session *tlsServerSession) error {
 }
 
 func (s *tlsServer) allocatePeerIDLocked() (uint32, bool) {
-	limit := uint32(s.resourcePolicy.maxClients)
-	if limit == 0 || limit > peerIDMaxValue {
-		return 0, false
-	}
-	for range limit {
-		candidate := s.peerIDCounter % limit
-		s.peerIDCounter = (candidate + 1) % limit
+	for candidate := range uint32(s.resourcePolicy.maxClients) {
 		if s.sessionByPeerID[candidate] == nil {
 			return candidate, true
 		}
@@ -619,6 +494,10 @@ func (s *tlsServer) unregisterSession(session *tlsServerSession) {
 	}
 	s.sessionAccess.Lock()
 	defer s.sessionAccess.Unlock()
+	s.evictSessionLocked(session)
+}
+
+func (s *tlsServer) evictSessionLocked(session *tlsServerSession) {
 	if s.sessionByPeer[session.peerAddress] == session {
 		delete(s.sessionByPeer, session.peerAddress)
 	}
@@ -633,32 +512,94 @@ func (s *tlsServer) unregisterSession(session *tlsServerSession) {
 			delete(s.udpSessionByAddress, address)
 		}
 	}
+	for address, boundSession := range s.udpInitialSessionByAddress {
+		if boundSession == session {
+			delete(s.udpInitialSessionByAddress, address)
+		}
+	}
 }
 
-func (s *tlsServer) findUDPSession(rawPacket []byte, peerAddress string) *tlsServerSession {
+type udpPacketVerdict uint8
+
+const (
+	udpPacketDeliver udpPacketVerdict = iota
+	// No session is bound to the source address, so the datagram may open one
+	// through the stateless session-id challenge.
+	udpPacketUnbound
+	// A session is bound to the source address and the datagram is a hard reset
+	// carrying a session id none of the sessions bound there owns.
+	udpPacketInitialReset
+	udpPacketDrop
+)
+
+type udpPacketRoute struct {
+	verdict udpPacketVerdict
+	session *tlsServerSession
+}
+
+// Upstream multi_get_create_instance_udp hands every datagram coming from an
+// address it already serves to that instance without consulting
+// tls_pre_decrypt_lite, and tls_pre_decrypt then routes it by the peer session
+// id it carries: a hard reset matching none of the instance's sessions starts a
+// TM_INITIAL session while TM_ACTIVE keeps running, and any other control packet
+// which matches none of them is unroutable.
+func (s *tlsServer) routeUDPPacketLocked(rawPacket []byte, peerAddress string) udpPacketRoute {
+	if len(rawPacket) == 0 {
+		return udpPacketRoute{verdict: udpPacketDrop}
+	}
 	peerID, peerIDEnabled := udpDataV2PeerID(rawPacket)
-	s.sessionAccess.RLock()
-	defer s.sessionAccess.RUnlock()
 	if peerIDEnabled {
 		// Upstream P_DATA_V2 selects a candidate by peer-id before authenticating a floated source address.
-		return s.sessionByPeerID[peerID]
+		session := s.sessionByPeerID[peerID]
+		if session == nil {
+			return udpPacketRoute{verdict: udpPacketDrop}
+		}
+		return udpPacketRoute{verdict: udpPacketDeliver, session: session}
 	}
-	return s.udpSessionByAddress[peerAddress]
+	activeSession := s.udpSessionByAddress[peerAddress]
+	initialSession := s.udpInitialSessionByAddress[peerAddress]
+	opcode := proto.Opcode(rawPacket[0] >> 3)
+	if !isControlOrAcknowledgmentOpcode(opcode) {
+		if activeSession == nil {
+			return udpPacketRoute{verdict: udpPacketDrop}
+		}
+		return udpPacketRoute{verdict: udpPacketDeliver, session: activeSession}
+	}
+	if len(rawPacket) < tlsControlHeaderLength {
+		return udpPacketRoute{verdict: udpPacketDrop}
+	}
+	var clientSessionID proto.SessionID
+	copy(clientSessionID[:], rawPacket[1:tlsControlHeaderLength])
+	if initialSession != nil && initialSession.remoteSessionID == clientSessionID {
+		return udpPacketRoute{verdict: udpPacketDeliver, session: initialSession}
+	}
+	if activeSession != nil && activeSession.remoteSessionID == clientSessionID {
+		return udpPacketRoute{verdict: udpPacketDeliver, session: activeSession}
+	}
+	if activeSession == nil && initialSession == nil {
+		return udpPacketRoute{verdict: udpPacketUnbound}
+	}
+	switch opcode {
+	case proto.OpcodeControlHardResetClientV2, proto.OpcodeControlHardResetClientV3:
+		return udpPacketRoute{verdict: udpPacketInitialReset}
+	}
+	return udpPacketRoute{verdict: udpPacketDrop}
 }
 
-func (s *tlsServer) findUDPSessions(rawPacketBuffers []*buf.Buffer, peerAddresses []string) []*tlsServerSession {
-	sessions := make([]*tlsServerSession, len(rawPacketBuffers))
+func (s *tlsServer) findUDPPacketRoute(rawPacket []byte, peerAddress string) udpPacketRoute {
+	s.sessionAccess.RLock()
+	defer s.sessionAccess.RUnlock()
+	return s.routeUDPPacketLocked(rawPacket, peerAddress)
+}
+
+func (s *tlsServer) findUDPPacketRoutes(rawPacketBuffers []*buf.Buffer, peerAddresses []string) []udpPacketRoute {
+	routes := make([]udpPacketRoute, len(rawPacketBuffers))
 	s.sessionAccess.RLock()
 	defer s.sessionAccess.RUnlock()
 	for i, rawPacketBuffer := range rawPacketBuffers {
-		peerID, peerIDEnabled := udpDataV2PeerID(rawPacketBuffer.Bytes())
-		if peerIDEnabled {
-			sessions[i] = s.sessionByPeerID[peerID]
-		} else {
-			sessions[i] = s.udpSessionByAddress[peerAddresses[i]]
-		}
+		routes[i] = s.routeUDPPacketLocked(rawPacketBuffer.Bytes(), peerAddresses[i])
 	}
-	return sessions
+	return routes
 }
 
 func udpDataV2PeerID(rawPacket []byte) (uint32, bool) {
@@ -674,33 +615,54 @@ func udpDataV2PeerID(rawPacket []byte) (uint32, bool) {
 	return peerID, true
 }
 
-func (s *tlsServer) commitAuthenticatedUDPAddress(session *tlsServerSession) bool {
+// multi_process_float (multi.c) runs only for a peer whose datagram arrived from
+// an address other than the one its instance is bound to, and it hands that
+// address over: the instance already holding it is closed unless its locked
+// certificate chain differs, in which case the float is refused and the packet
+// is discarded by zeroing the instance buffer.
+func (s *tlsServer) floatAuthenticatedUDPPeer(session *tlsServerSession) bool {
 	udpConnection, ok := session.packetConnection.(*udpPeerPacketConnection)
 	if !ok {
 		return true
 	}
-	remoteAddress := udpConnection.authenticatedRemoteAddress()
-	if remoteAddress == nil {
-		return false
+	sourceAddress := udpConnection.floatCandidateAddress()
+	if sourceAddress == nil {
+		return true
 	}
-	newAddress := remoteAddress.String()
-	s.lifecycleAccess.Lock()
-	defer s.lifecycleAccess.Unlock()
-	if s.lifecycleState != serverLifecycleRunning {
-		return false
+	displaced, floated := s.floatUDPSessionToSource(session, udpConnection, sourceAddress)
+	if displaced != nil {
+		_ = displaced.Close()
 	}
+	return floated
+}
+
+func (s *tlsServer) floatUDPSessionToSource(
+	session *tlsServerSession,
+	udpConnection *udpPeerPacketConnection,
+	sourceAddress net.Addr,
+) (*tlsServerSession, bool) {
+	newAddress := sourceAddress.String()
 	udpConnection.writer.writeAccess.Lock()
 	defer udpConnection.writer.writeAccess.Unlock()
 	s.sessionAccess.Lock()
 	defer s.sessionAccess.Unlock()
 	if s.sessionByPeer[session.peerAddress] != session {
-		return false
+		return nil, false
 	}
 	if session.peerIDAssigned && s.sessionByPeerID[session.serverPeerID] != session {
-		return false
+		return nil, false
 	}
-	if existing := s.udpSessionByAddress[newAddress]; existing != nil && existing != session {
-		return false
+	var displaced *tlsServerSession
+	existing := s.udpSessionByAddress[newAddress]
+	if existing != nil && existing != session {
+		if !equalClientCertificateIdentity(
+			existing.lockedCertificateIdentity.Load(),
+			session.lockedCertificateIdentity.Load(),
+		) {
+			return nil, false
+		}
+		s.evictSessionLocked(existing)
+		displaced = existing
 	}
 	for address, boundSession := range s.udpSessionByAddress {
 		if boundSession == session && address != newAddress {
@@ -708,6 +670,6 @@ func (s *tlsServer) commitAuthenticatedUDPAddress(session *tlsServerSession) boo
 		}
 	}
 	s.udpSessionByAddress[newAddress] = session
-	udpConnection.setRemoteAddress(remoteAddress)
-	return true
+	udpConnection.setRemoteAddress(sourceAddress)
+	return displaced, true
 }

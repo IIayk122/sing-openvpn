@@ -123,8 +123,7 @@ func (c *tlsClient) handleServerPushedInfo(controlRecord []byte, deadline time.T
 			c.parent.noteChallengeResponseSubmitted()
 			// Upstream man_send_cc_message (manage.c) sends management cr-response answers as CR_RESPONSE,<base64>.
 			responsePayload := tlsControlStringPayload([]byte("CR_RESPONSE," + base64.StdEncoding.EncodeToString([]byte(response.Secret))))
-			_, responseErr := c.tlsConnection.Write(responsePayload)
-			return responseErr
+			return c.writeControlChannelPayload(responsePayload, time.Now().Add(c.handshakeWindow))
 		}
 	}
 	c.parent.publishChallenge(state)

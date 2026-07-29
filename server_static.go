@@ -3,24 +3,27 @@ package openvpn
 import (
 	"context"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type staticKeyServer struct {
-	parent         *Server
-	client         *Client
-	loopContext    context.Context
-	cancelLoop     context.CancelFunc
-	streamListener net.Listener
-	packetListener net.PacketConn
-	access         sync.RWMutex
-	peerAddress    string
-	readLoopDone   chan struct{}
+	parent          *Server
+	client          *Client
+	loopContext     context.Context
+	cancelLoop      context.CancelFunc
+	transportAccess sync.Mutex
+	streamListener  net.Listener
+	packetLink      *staticServerPacketLink
+	access          sync.RWMutex
+	peerAddress     string
+	readLoopDone    chan struct{}
 }
 
 func newStaticKeyServer(parent *Server) *staticKeyServer {
@@ -95,7 +98,9 @@ func (s *staticKeyServer) prepareTransport() (Remote, error) {
 				return Remote{}, err
 			}
 		}
+		s.transportAccess.Lock()
 		s.streamListener = listener
+		s.transportAccess.Unlock()
 		host, port, err := splitStaticServerAddress(listener.Addr().String())
 		if err != nil {
 			return Remote{}, err
@@ -116,7 +121,9 @@ func (s *staticKeyServer) prepareTransport() (Remote, error) {
 			return Remote{}, err
 		}
 	}
-	s.packetListener = packetListener
+	s.transportAccess.Lock()
+	s.packetLink = &staticServerPacketLink{listener: packetListener, remoteAddress: remoteNetworkAddress}
+	s.transportAccess.Unlock()
 	s.setPeerAddress(remoteNetworkAddress.String())
 	host, port, err := splitStaticServerAddress(remoteNetworkAddress.String())
 	if err != nil {
@@ -144,19 +151,25 @@ func splitStaticServerAddress(address string) (string, uint16, error) {
 }
 
 func (s *staticKeyServer) dialContext(ctx context.Context, network string, address string) (net.Conn, error) {
+	s.transportAccess.Lock()
+	streamListener := s.streamListener
+	packetLink := s.packetLink
+	s.transportAccess.Unlock()
 	if strings.HasPrefix(s.parent.protocol, "tcp") {
-		connection, err := s.streamListener.Accept()
+		if streamListener == nil {
+			return nil, net.ErrClosed
+		}
+		connection, err := streamListener.Accept()
 		if err != nil {
 			return nil, err
 		}
 		s.setPeerAddress(connection.RemoteAddr().String())
 		return connection, nil
 	}
-	remoteAddress, err := net.ResolveUDPAddr(s.parent.listenNetwork, s.parent.options.Transport.RemoteAddress)
-	if err != nil {
-		return nil, err
+	if packetLink == nil {
+		return nil, net.ErrClosed
 	}
-	return &staticServerPacketConnection{PacketConn: s.packetListener, remoteAddress: remoteAddress}, nil
+	return packetLink.newSession(), nil
 }
 
 func (s *staticKeyServer) setPeerAddress(peerAddress string) {
@@ -236,39 +249,193 @@ func (s *staticKeyServer) Close() error {
 }
 
 func (s *staticKeyServer) closeTransport() error {
+	s.transportAccess.Lock()
+	streamListener := s.streamListener
+	s.streamListener = nil
+	packetLink := s.packetLink
+	s.packetLink = nil
+	s.transportAccess.Unlock()
 	var err error
-	if s.streamListener != nil {
-		err = E.Errors(err, s.streamListener.Close())
-		s.streamListener = nil
+	if streamListener != nil {
+		err = E.Errors(err, streamListener.Close())
 	}
-	if s.packetListener != nil {
-		err = E.Errors(err, s.packetListener.Close())
-		s.packetListener = nil
+	if packetLink != nil {
+		err = E.Errors(err, packetLink.Close())
 	}
 	return err
 }
 
-type staticServerPacketConnection struct {
-	net.PacketConn
+// A --secret peer that restarts its tunnel takes the SIGUSR1 path of openvpn.c,
+// which re-enters link_socket_init with the unchanged --lport: the bound
+// datagram endpoint belongs to the process and keeps answering the peer, while
+// the session that used it is the only thing the restart tears down.
+type staticServerPacketLink struct {
+	listener      net.PacketConn
 	remoteAddress net.Addr
+	readAccess    sync.Mutex
+	writeAccess   sync.Mutex
+	stateAccess   sync.Mutex
+	activeReader  *staticServerPacketConnection
+	closeOnce     sync.Once
+	closeErr      error
+}
+
+func (l *staticServerPacketLink) newSession() *staticServerPacketConnection {
+	return &staticServerPacketConnection{link: l, closed: make(chan struct{})}
+}
+
+func (l *staticServerPacketLink) Close() error {
+	l.closeOnce.Do(func() {
+		l.closeErr = l.listener.Close()
+	})
+	return l.closeErr
+}
+
+func (l *staticServerPacketLink) readFrom(session *staticServerPacketConnection, buffer []byte) (int, net.Addr, error) {
+	l.readAccess.Lock()
+	defer l.readAccess.Unlock()
+	select {
+	case <-session.closed:
+		return 0, nil, net.ErrClosed
+	default:
+	}
+	l.stateAccess.Lock()
+	l.activeReader = session
+	readDeadline, _ := session.currentReadDeadline()
+	deadlineErr := l.listener.SetReadDeadline(readDeadline)
+	l.stateAccess.Unlock()
+	if deadlineErr != nil {
+		l.finishRead(session)
+		return 0, nil, deadlineErr
+	}
+	dataLength, source, err := l.listener.ReadFrom(buffer)
+	l.finishRead(session)
+	return dataLength, source, err
+}
+
+func (l *staticServerPacketLink) finishRead(session *staticServerPacketConnection) {
+	l.stateAccess.Lock()
+	if l.activeReader == session {
+		l.activeReader = nil
+	}
+	l.stateAccess.Unlock()
+}
+
+func (l *staticServerPacketLink) setReadDeadline(session *staticServerPacketConnection, deadline time.Time) error {
+	l.stateAccess.Lock()
+	defer l.stateAccess.Unlock()
+	session.deadlineAccess.Lock()
+	session.readDeadline = deadline
+	session.deadlineAccess.Unlock()
+	if l.activeReader != session {
+		return nil
+	}
+	return l.listener.SetReadDeadline(deadline)
+}
+
+func (l *staticServerPacketLink) interruptRead(session *staticServerPacketConnection) {
+	l.stateAccess.Lock()
+	defer l.stateAccess.Unlock()
+	if l.activeReader != session {
+		return
+	}
+	_ = l.listener.SetReadDeadline(time.Now())
+}
+
+func (l *staticServerPacketLink) writeTo(buffer []byte) (int, error) {
+	l.writeAccess.Lock()
+	defer l.writeAccess.Unlock()
+	return l.listener.WriteTo(buffer, l.remoteAddress)
+}
+
+type staticServerPacketConnection struct {
+	link           *staticServerPacketLink
+	deadlineAccess sync.Mutex
+	readDeadline   time.Time
+	writeDeadline  time.Time
+	closeOnce      sync.Once
+	closed         chan struct{}
 }
 
 func (c *staticServerPacketConnection) Read(buffer []byte) (int, error) {
 	for {
-		dataLength, source, err := c.PacketConn.ReadFrom(buffer)
+		select {
+		case <-c.closed:
+			return 0, net.ErrClosed
+		default:
+		}
+		readDeadline, hasDeadline := c.currentReadDeadline()
+		if hasDeadline && !time.Now().Before(readDeadline) {
+			return 0, os.ErrDeadlineExceeded
+		}
+		dataLength, source, err := c.link.readFrom(c, buffer)
 		if err != nil {
+			if E.IsTimeout(err) {
+				continue
+			}
 			return 0, err
 		}
-		if source.String() == c.remoteAddress.String() {
-			return dataLength, nil
+		if source.String() != c.link.remoteAddress.String() {
+			continue
 		}
+		return dataLength, nil
 	}
 }
 
 func (c *staticServerPacketConnection) Write(buffer []byte) (int, error) {
-	return c.PacketConn.WriteTo(buffer, c.remoteAddress)
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	writeDeadline, hasDeadline := c.currentWriteDeadline()
+	if hasDeadline && !time.Now().Before(writeDeadline) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return c.link.writeTo(buffer)
+}
+
+func (c *staticServerPacketConnection) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		c.link.interruptRead(c)
+	})
+	return nil
+}
+
+func (c *staticServerPacketConnection) LocalAddr() net.Addr {
+	return c.link.listener.LocalAddr()
 }
 
 func (c *staticServerPacketConnection) RemoteAddr() net.Addr {
-	return c.remoteAddress
+	return c.link.remoteAddress
 }
+
+func (c *staticServerPacketConnection) SetDeadline(deadline time.Time) error {
+	return E.Errors(c.SetReadDeadline(deadline), c.SetWriteDeadline(deadline))
+}
+
+func (c *staticServerPacketConnection) SetReadDeadline(deadline time.Time) error {
+	return c.link.setReadDeadline(c, deadline)
+}
+
+func (c *staticServerPacketConnection) SetWriteDeadline(deadline time.Time) error {
+	c.deadlineAccess.Lock()
+	defer c.deadlineAccess.Unlock()
+	c.writeDeadline = deadline
+	return nil
+}
+
+func (c *staticServerPacketConnection) currentReadDeadline() (time.Time, bool) {
+	c.deadlineAccess.Lock()
+	defer c.deadlineAccess.Unlock()
+	return c.readDeadline, !c.readDeadline.IsZero()
+}
+
+func (c *staticServerPacketConnection) currentWriteDeadline() (time.Time, bool) {
+	c.deadlineAccess.Lock()
+	defer c.deadlineAccess.Unlock()
+	return c.writeDeadline, !c.writeDeadline.IsZero()
+}
+
+var _ net.Conn = (*staticServerPacketConnection)(nil)

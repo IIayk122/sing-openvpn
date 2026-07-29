@@ -25,6 +25,7 @@ type compressionNegotiationInteropCase struct {
 }
 
 func TestOpenVPNInteropCompressionNegotiation(t *testing.T) {
+	t.Parallel()
 	testCases := []compressionNegotiationInteropCase{
 		{
 			name: "pushed_lzo_stub_under_no",
@@ -91,9 +92,11 @@ push "compress lz4-v2"`,
 	}
 	for _, version := range []string{"2.5.11", "2.6.14"} {
 		t.Run("openvpn_"+version, func(versionTest *testing.T) {
+			versionTest.Parallel()
 			env := requireInteropEnvironmentVersion(versionTest, version)
 			for _, testCase := range testCases {
 				versionTest.Run(testCase.name, func(caseTest *testing.T) {
+					caseTest.Parallel()
 					runCompressionNegotiationInteropCase(caseTest, env, testCase)
 				})
 			}
@@ -107,7 +110,7 @@ func runCompressionNegotiationInteropCase(t *testing.T, env interopEnvironment, 
 	t.Cleanup(func() {
 		dumpInteropLogs(t, workspace)
 	})
-	serverPort := reserveUDPPort(t)
+	serverPort := reserveInteropPort(t, "udp")
 	serverConfiguration := fmt.Sprintf(`port %d
 proto udp4
 dev tun
@@ -138,7 +141,7 @@ log %s
 		t.Fatalf("write compression server config: %v", err)
 	}
 	startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-compression-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-compression-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"openvpn", "--config", filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "compression-server.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},
@@ -148,7 +151,7 @@ log %s
 	serverLogPath := filepath.Join(workspace.logsDir, "compression-server.log")
 	waitForLogLine(t, serverLogPath, "Initialization Sequence Completed", 20*time.Second)
 
-	clientPort := reserveUDPPort(t)
+	clientPort := reserveInteropPort(t, "udp")
 	packetLengthRecorder := new(interopPacketLengthRecorder)
 	clientContext, cancelClient := context.WithTimeout(context.Background(), 30*time.Second)
 	client, err := openvpn.NewClient(openvpn.ClientOptions{

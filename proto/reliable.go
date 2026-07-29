@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -44,17 +45,34 @@ func NewOutgoingReliableState() *OutgoingReliableState {
 	}
 }
 
-func (s *OutgoingReliableState) TryInsertOutgoingPacket(packet *Packet) bool {
+// Upstream write_outgoing_tls_ciphertext takes the send buffer slot with
+// reliable_get_buf_output_sequenced, reliable_mark_active_outgoing spends the
+// control packet id on that slot and write_control_auth then moves the
+// acknowledgment ids out of the pending list into the packet, all without
+// releasing the reliable layer in between: no packet id is spent for a packet
+// the send buffer cannot hold, and no acknowledgment id leaves the pending list
+// for a packet which is never built.  A full send buffer returns no packet and
+// takes nothing.
+func (s *OutgoingReliableState) InsertOutgoingPacket(
+	maximumAcknowledgments int,
+	newPacket func(acknowledgmentIDs []PacketID) (*Packet, error),
+) (*Packet, error) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if len(s.inFlightPackets) >= ReliableSendBufferSize {
-		return false
+		return nil, nil
+	}
+	acknowledgmentIDs := s.takeAcknowledgmentIDsLocked(maximumAcknowledgments)
+	packet, err := newPacket(acknowledgmentIDs)
+	if err != nil {
+		s.returnAcknowledgmentIDsLocked(acknowledgmentIDs)
+		return nil, err
 	}
 	s.inFlightPackets = append(s.inFlightPackets, &inFlightPacket{packet: packet})
 	sort.SliceStable(s.inFlightPackets, func(leftIndex, rightIndex int) bool {
 		return s.inFlightPackets[leftIndex].packet.ID < s.inFlightPackets[rightIndex].packet.ID
 	})
-	return true
+	return packet, nil
 }
 
 func (s *OutgoingReliableState) OnIncomingPacket(packet *Packet) {
@@ -84,19 +102,41 @@ func (s *OutgoingReliableState) OnIncomingPacket(packet *Packet) {
 	})
 }
 
-func (s *OutgoingReliableState) NextAcknowledgmentIDs() []PacketID {
+// Upstream reliable_ack_outstanding, which calc_control_channel_frame_overhead
+// reads to size a control packet without consuming anything.
+func (s *OutgoingReliableState) PendingAcknowledgmentCount() int {
 	s.access.Lock()
 	defer s.access.Unlock()
+	return len(s.pendingAcknowledgmentID)
+}
 
+// Upstream reliable_ack_write, which removes exactly the ids it wrote into the
+// packet buffer write_control_auth hands to the link.
+func (s *OutgoingReliableState) TakeAcknowledgmentIDs(maximumCount int) []PacketID {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.takeAcknowledgmentIDsLocked(maximumCount)
+}
+
+// A packet which never reached the link acknowledges nothing, so the ids it
+// took belong back on the pending list.
+func (s *OutgoingReliableState) ReturnAcknowledgmentIDs(acknowledgmentIDs []PacketID) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.returnAcknowledgmentIDsLocked(acknowledgmentIDs)
+}
+
+func (s *OutgoingReliableState) takeAcknowledgmentIDsLocked(maximumCount int) []PacketID {
+	if maximumCount <= 0 || len(s.pendingAcknowledgmentID) == 0 {
+		return nil
+	}
 	acknowledgmentIDs := make([]PacketID, 0, len(s.pendingAcknowledgmentID))
 	for pendingID := range s.pendingAcknowledgmentID {
 		acknowledgmentIDs = append(acknowledgmentIDs, pendingID)
 	}
-	sort.SliceStable(acknowledgmentIDs, func(leftIndex, rightIndex int) bool {
-		return acknowledgmentIDs[leftIndex] < acknowledgmentIDs[rightIndex]
-	})
-	if len(acknowledgmentIDs) > MaximumAcknowledgmentsPerPacket {
-		acknowledgmentIDs = acknowledgmentIDs[:MaximumAcknowledgmentsPerPacket]
+	slices.Sort(acknowledgmentIDs)
+	if len(acknowledgmentIDs) > maximumCount {
+		acknowledgmentIDs = acknowledgmentIDs[:maximumCount]
 	}
 	for _, acknowledgedID := range acknowledgmentIDs {
 		delete(s.pendingAcknowledgmentID, acknowledgedID)
@@ -104,10 +144,14 @@ func (s *OutgoingReliableState) NextAcknowledgmentIDs() []PacketID {
 	return acknowledgmentIDs
 }
 
-func (s *OutgoingReliableState) HasPendingAcknowledgments() bool {
-	s.access.Lock()
-	defer s.access.Unlock()
-	return len(s.pendingAcknowledgmentID) > 0
+func (s *OutgoingReliableState) returnAcknowledgmentIDsLocked(acknowledgmentIDs []PacketID) {
+	for _, acknowledgmentID := range acknowledgmentIDs {
+		_, pending := s.pendingAcknowledgmentID[acknowledgmentID]
+		if !pending && len(s.pendingAcknowledgmentID) >= AcknowledgmentSetCapacity {
+			return
+		}
+		s.pendingAcknowledgmentID[acknowledgmentID] = struct{}{}
+	}
 }
 
 func (s *OutgoingReliableState) HasInFlightPackets() bool {

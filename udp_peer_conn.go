@@ -7,18 +7,18 @@ import (
 	"time"
 
 	"github.com/sagernet/sing/common/buf"
-	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
+// One listener carries every peer of the server, so nothing a single peer
+// decides may reach it: a deadline armed for one peer's write would bound the
+// writes of all the others and outlive the write it was meant for.
 type udpPacketWriter struct {
 	listener     net.PacketConn
 	batchWriter  N.PacketBatchWriter
 	destinations []M.Socksaddr
 	writeAccess  sync.Mutex
-	stateAccess  sync.Mutex
-	activePeer   *udpPeerPacketConnection
 }
 
 type udpPeerPacketConnection struct {
@@ -34,7 +34,6 @@ type udpPeerPacketConnection struct {
 	closed          chan struct{}
 	deadlineAccess  sync.Mutex
 	readDeadline    time.Time
-	writeDeadline   time.Time
 }
 
 type udpPeerPacket struct {
@@ -73,8 +72,7 @@ func (c *udpPeerPacketConnection) waitIncomingPackets(maxPackets int) ([]udpPeer
 		default:
 		}
 		packets := c.incomingPackets.Pop(maxPackets, func(firstPacket udpPeerPacket, packet udpPeerPacket) bool {
-			return firstPacket.remoteAddress.Network() == packet.remoteAddress.Network() &&
-				firstPacket.remoteAddress.String() == packet.remoteAddress.String()
+			return equalPacketSource(firstPacket.remoteAddress, packet.remoteAddress)
 		})
 		if len(packets) > 0 {
 			return packets, nil
@@ -135,8 +133,8 @@ func (c *udpPeerPacketConnection) SetReadDeadline(deadline time.Time) error {
 	return nil
 }
 
-func (c *udpPeerPacketConnection) SetWriteDeadline(deadline time.Time) error {
-	return c.writer.setWriteDeadline(c, deadline)
+func (c *udpPeerPacketConnection) ConnectionOriented() bool {
+	return false
 }
 
 func (c *udpPeerPacketConnection) Close() error {
@@ -187,10 +185,25 @@ func (c *udpPeerPacketConnection) setReadAddress(remoteAddress net.Addr) {
 	c.remoteAccess.Unlock()
 }
 
-func (c *udpPeerPacketConnection) authenticatedRemoteAddress() net.Addr {
+func (c *udpPeerPacketConnection) floatCandidateAddress() net.Addr {
 	c.remoteAccess.RLock()
 	defer c.remoteAccess.RUnlock()
+	if c.readAddress == nil || equalPacketSource(c.readAddress, c.remoteAddress) {
+		return nil
+	}
 	return c.readAddress
+}
+
+func equalPacketSource(left net.Addr, right net.Addr) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	leftUDP, leftIsUDP := left.(*net.UDPAddr)
+	rightUDP, rightIsUDP := right.(*net.UDPAddr)
+	if leftIsUDP && rightIsUDP {
+		return leftUDP.Port == rightUDP.Port && leftUDP.Zone == rightUDP.Zone && leftUDP.IP.Equal(rightUDP.IP)
+	}
+	return left.Network() == right.Network() && left.String() == right.String()
 }
 
 func (c *udpPeerPacketConnection) setRemoteAddress(remoteAddress net.Addr) {
@@ -205,32 +218,12 @@ func (c *udpPeerPacketConnection) currentReadDeadline() (time.Time, bool) {
 	return c.readDeadline, !c.readDeadline.IsZero()
 }
 
-func (c *udpPeerPacketConnection) currentWriteDeadline() (time.Time, bool) {
-	c.deadlineAccess.Lock()
-	defer c.deadlineAccess.Unlock()
-	return c.writeDeadline, !c.writeDeadline.IsZero()
-}
-
 func (w *udpPacketWriter) writePackets(peer *udpPeerPacketConnection, packets [][]byte) (int, error) {
 	w.writeAccess.Lock()
 	defer w.writeAccess.Unlock()
-
-	w.stateAccess.Lock()
-	writeDeadline, hasDeadline := peer.currentWriteDeadline()
-	if hasDeadline && !time.Now().Before(writeDeadline) {
-		w.stateAccess.Unlock()
-		return 0, os.ErrDeadlineExceeded
-	}
-	w.activePeer = peer
-	deadlineErr := w.listener.SetWriteDeadline(writeDeadline)
-	w.stateAccess.Unlock()
-	if deadlineErr != nil {
-		return 0, E.Errors(deadlineErr, w.finishWrite(peer))
-	}
-
 	remoteAddress := peer.RemoteAddr()
 	if remoteAddress == nil {
-		return 0, E.Errors(net.ErrClosed, w.finishWrite(peer))
+		return 0, net.ErrClosed
 	}
 	if w.batchWriter != nil && len(packets) > 0 {
 		packetBuffers := make([]*buf.Buffer, len(packets))
@@ -242,42 +235,26 @@ func (w *udpPacketWriter) writePackets(peer *udpPeerPacketConnection, packets []
 		}
 		writeErr := w.batchWriter.WritePacketBatch(packetBuffers, destinations)
 		if writeErr != nil {
-			return 0, E.Errors(writeErr, peer.Close(), w.finishWrite(peer))
+			return 0, writeErr
 		}
-		return len(packets), w.finishWrite(peer)
+		return len(packets), nil
 	}
 	for i, packet := range packets {
 		_, writeErr := w.listener.WriteTo(packet, remoteAddress)
 		if writeErr != nil {
-			return i, E.Errors(writeErr, w.finishWrite(peer))
+			return i, writeErr
 		}
 	}
-	return len(packets), w.finishWrite(peer)
+	return len(packets), nil
 }
 
 func (w *udpPacketWriter) writePacketBuffers(peer *udpPeerPacketConnection, packetBuffers []*buf.Buffer) (int, error) {
 	w.writeAccess.Lock()
 	defer w.writeAccess.Unlock()
-
-	w.stateAccess.Lock()
-	writeDeadline, hasDeadline := peer.currentWriteDeadline()
-	if hasDeadline && !time.Now().Before(writeDeadline) {
-		w.stateAccess.Unlock()
-		buf.ReleaseMulti(packetBuffers)
-		return 0, os.ErrDeadlineExceeded
-	}
-	w.activePeer = peer
-	deadlineErr := w.listener.SetWriteDeadline(writeDeadline)
-	w.stateAccess.Unlock()
-	if deadlineErr != nil {
-		buf.ReleaseMulti(packetBuffers)
-		return 0, E.Errors(deadlineErr, w.finishWrite(peer))
-	}
-
 	remoteAddress := peer.RemoteAddr()
 	if remoteAddress == nil {
 		buf.ReleaseMulti(packetBuffers)
-		return 0, E.Errors(net.ErrClosed, w.finishWrite(peer))
+		return 0, net.ErrClosed
 	}
 	if w.batchWriter != nil && len(packetBuffers) > 0 {
 		destination := M.SocksaddrFromNet(remoteAddress)
@@ -294,19 +271,19 @@ func (w *udpPacketWriter) writePacketBuffers(peer *udpPeerPacketConnection, pack
 		clear(destinations)
 		w.destinations = destinations[:0]
 		if writeErr != nil {
-			return 0, E.Errors(writeErr, peer.Close(), w.finishWrite(peer))
+			return 0, writeErr
 		}
-		return len(packetBuffers), w.finishWrite(peer)
+		return len(packetBuffers), nil
 	}
 	for i, packetBuffer := range packetBuffers {
 		_, writeErr := w.listener.WriteTo(packetBuffer.Bytes(), remoteAddress)
 		packetBuffer.Release()
 		if writeErr != nil {
 			buf.ReleaseMulti(packetBuffers[i+1:])
-			return i, E.Errors(writeErr, w.finishWrite(peer))
+			return i, writeErr
 		}
 	}
-	return len(packetBuffers), w.finishWrite(peer)
+	return len(packetBuffers), nil
 }
 
 func (w *udpPacketWriter) writePacketTo(packet []byte, remoteAddress net.Addr) error {
@@ -315,38 +292,6 @@ func (w *udpPacketWriter) writePacketTo(packet []byte, remoteAddress net.Addr) e
 	}
 	w.writeAccess.Lock()
 	defer w.writeAccess.Unlock()
-
-	w.stateAccess.Lock()
-	w.activePeer = nil
-	deadlineErr := w.listener.SetWriteDeadline(time.Time{})
-	w.stateAccess.Unlock()
-	if deadlineErr != nil {
-		return deadlineErr
-	}
 	_, writeErr := w.listener.WriteTo(packet, remoteAddress)
-	clearErr := w.listener.SetWriteDeadline(time.Time{})
-	return E.Errors(writeErr, clearErr)
-}
-
-func (w *udpPacketWriter) setWriteDeadline(peer *udpPeerPacketConnection, deadline time.Time) error {
-	w.stateAccess.Lock()
-	defer w.stateAccess.Unlock()
-	peer.deadlineAccess.Lock()
-	peer.writeDeadline = deadline
-	peer.deadlineAccess.Unlock()
-	if w.activePeer != peer {
-		return nil
-	}
-	return w.listener.SetWriteDeadline(deadline)
-}
-
-func (w *udpPacketWriter) finishWrite(peer *udpPeerPacketConnection) error {
-	w.stateAccess.Lock()
-	defer w.stateAccess.Unlock()
-	if w.activePeer != peer {
-		return nil
-	}
-	clearErr := w.listener.SetWriteDeadline(time.Time{})
-	w.activePeer = nil
-	return clearErr
+	return writeErr
 }

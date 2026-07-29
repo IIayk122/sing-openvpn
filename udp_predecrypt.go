@@ -1,7 +1,6 @@
 package openvpn
 
 import (
-	"encoding/binary"
 	"net"
 	"time"
 
@@ -65,6 +64,11 @@ func (s *tlsServer) preDecryptUDPPacket(rawPacket []byte, peerAddress net.Addr, 
 		if err != nil {
 			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, err
 		}
+		// Upstream charges its --connect-freq-initial budget to initial resets only,
+		// leaving every later pre-decrypt opcode unmetered.
+		if !s.resourcePolicy.allowInitialPacket(now) {
+			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("initial packet rate limit exceeded")
+		}
 		if packet.Opcode == proto.OpcodeControlHardResetClientV3 && !earlyNegotiation {
 			if s.parent.options.TLS.CryptV2ForceCookie {
 				return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("tls-crypt-v2 client does not support stateless cookie negotiation")
@@ -114,11 +118,6 @@ func (s *tlsServer) preDecryptUDPPacket(rawPacket []byte, peerAddress net.Addr, 
 		if !s.sessionIDHMACSigner.validateAt(packet.LocalSessionID, peerAddress, packet.RemoteSessionID, now.Unix()) {
 			return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("invalid UDP session-id cookie")
 		}
-		if len(s.tlsCryptV2Server) > 0 {
-			if packet.Opcode != proto.OpcodeControlWKCv1 {
-				return udpPreDecryptResult{verdict: udpPreDecryptDrop}, E.New("tls-crypt-v2 cookie response is missing wrapped client key")
-			}
-		}
 		seedUDPProtectionAfterChallenge(protection)
 		return udpPreDecryptResult{
 			verdict:         udpPreDecryptAccept,
@@ -134,55 +133,10 @@ func (s *tlsServer) preDecryptUDPPacket(rawPacket []byte, peerAddress net.Addr, 
 
 func (s *tlsServer) decodeUDPPreDecryptPacket(rawPacket []byte) (*proto.Packet, tlsControlProtection, bool, error) {
 	opcode := proto.Opcode(rawPacket[0] >> 3)
-	packetBytes := rawPacket
-	protection := tlsControlProtection{
-		auth:  s.staticProtection.auth.newSessionCodec(),
-		crypt: s.staticProtection.crypt.newSessionCodec(),
-	}
-	var earlyNegotiation bool
-
-	if len(s.tlsCryptV2Server) > 0 {
-		if opcode != proto.OpcodeControlHardResetClientV3 && opcode != proto.OpcodeControlWKCv1 {
-			return nil, tlsControlProtection{}, false, E.New("tls-crypt-v2 requires a wrapped client key during UDP cookie negotiation")
-		}
-		if len(rawPacket) < tlsControlHeaderLength+2 {
-			return nil, tlsControlProtection{}, false, E.New("invalid tls-crypt-v2 packet")
-		}
-		wrappedKeyLength := int(binary.BigEndian.Uint16(rawPacket[len(rawPacket)-2:]))
-		if wrappedKeyLength < tlsCryptTagLength+2 || wrappedKeyLength > len(rawPacket)-tlsControlHeaderLength {
-			return nil, tlsControlProtection{}, false, E.New("invalid tls-crypt-v2 wrapped key")
-		}
-		wrappedClientKey := rawPacket[len(rawPacket)-wrappedKeyLength:]
-		clientKeyMaterial, unwrapErr := unwrapTLSCryptV2ClientKey(wrappedClientKey, s.tlsCryptV2Server)
-		if unwrapErr != nil {
-			return nil, tlsControlProtection{}, false, unwrapErr
-		}
-		cryptCodec, codecErr := newControlCryptCodecFromMaterial(clientKeyMaterial, tlsCryptKeyDirectionNormal)
-		if codecErr != nil {
-			return nil, tlsControlProtection{}, false, codecErr
-		}
-		protection.crypt = cryptCodec
-		packetBytes = rawPacket[:len(rawPacket)-wrappedKeyLength]
-		if opcode == proto.OpcodeControlHardResetClientV3 && len(packetBytes) >= tlsControlHeaderLength+4 {
-			longPacketID := binary.BigEndian.Uint32(packetBytes[tlsControlHeaderLength : tlsControlHeaderLength+4])
-			earlyNegotiation = longPacketID&tlsCryptV2EarlyNegotiationStart == tlsCryptV2EarlyNegotiationStart
-		}
-	} else if opcode == proto.OpcodeControlHardResetClientV3 || opcode == proto.OpcodeControlWKCv1 {
-		return nil, tlsControlProtection{}, false, E.New("unexpected tls-crypt-v2 opcode")
-	}
-
-	if protection.crypt != nil {
-		decodedPacket, decoded := protection.crypt.decodeControlPacket(packetBytes)
-		if !decoded {
-			return nil, tlsControlProtection{}, false, E.New("invalid tls-crypt packet")
-		}
-		packetBytes = decodedPacket
-	} else if protection.auth != nil {
-		decodedPacket, decoded := protection.auth.decodeControlPacket(packetBytes)
-		if !decoded {
-			return nil, tlsControlProtection{}, false, E.New("invalid tls-auth packet")
-		}
-		packetBytes = decodedPacket
+	protection := s.staticProtection.newSessionProtection()
+	packetBytes, err := protection.decodeIncomingControlPacket(rawPacket)
+	if err != nil {
+		return nil, tlsControlProtection{}, false, err
 	}
 	packet, err := proto.ParsePacket(packetBytes)
 	if err != nil {
@@ -191,6 +145,7 @@ func (s *tlsServer) decodeUDPPreDecryptPacket(rawPacket []byte) (*proto.Packet, 
 	if packet.Opcode != opcode {
 		return nil, tlsControlProtection{}, false, E.New("UDP pre-decrypt opcode mismatch")
 	}
+	earlyNegotiation := opcode == proto.OpcodeControlHardResetClientV3 && tlsCryptV2ResetAnnouncesEarlyNegotiation(rawPacket)
 	return packet, protection, earlyNegotiation, nil
 }
 
@@ -199,13 +154,7 @@ func encodeUDPPreDecryptPacket(packet *proto.Packet, protection tlsControlProtec
 	if err != nil {
 		return nil, err
 	}
-	if protection.crypt != nil {
-		return protection.crypt.encodeControlPacket(rawPacket), nil
-	}
-	if protection.auth != nil {
-		return protection.auth.encodeControlPacket(rawPacket), nil
-	}
-	return rawPacket, nil
+	return protection.encodeOutgoingControlPacket(rawPacket), nil
 }
 
 // Upstream session_skip_to_pre_start starts the admitted key_state's reliable

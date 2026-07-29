@@ -17,12 +17,13 @@ import (
 )
 
 func TestOpenVPNInteropFragmentSequenceWrapDoesNotMixPackets(t *testing.T) {
+	t.Parallel()
 	env := requireInteropEnvironmentVersion(t, openVPNInteropDefaultVersion)
 	workspace := newInteropWorkspace(t)
 	t.Cleanup(func() {
 		dumpInteropLogs(t, workspace)
 	})
-	serverPort := reserveUDPPort(t)
+	serverPort := reserveInteropPort(t, "udp")
 	serverConfiguration := fmt.Sprintf(`port %d
 proto udp4
 dev tun
@@ -52,7 +53,7 @@ log %s
 		t.Fatal(err)
 	}
 	startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-fragment-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-fragment-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"openvpn", "--config", filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "fragment-server.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},

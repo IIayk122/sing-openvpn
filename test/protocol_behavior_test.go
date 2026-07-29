@@ -12,6 +12,7 @@ import (
 )
 
 func TestMissingProtocolBehavior_AddressPoolAssignsClientIPv4Address(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	server, err := NewServer(ServerOptions{
 		Context:   context.Background(),
@@ -78,6 +79,7 @@ func TestMissingProtocolBehavior_AddressPoolAssignsClientIPv4Address(t *testing.
 }
 
 func TestMissingProtocolBehavior_AddressPoolAssignsClientIPv6Address(t *testing.T) {
+	t.Parallel()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 	server, err := NewServer(ServerOptions{
 		Context:   context.Background(),
@@ -130,7 +132,7 @@ func TestMissingProtocolBehavior_AddressPoolAssignsClientIPv6Address(t *testing.
 			}
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(interopPollInterval)
 	}
 	if len(configuration.LocalIPv6) == 0 {
 		t.Fatal("expected ifconfig-ipv6-pool assignment")

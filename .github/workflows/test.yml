@@ -33,23 +33,6 @@ jobs:
           go-version: ${{ matrix.go-version }}
           cache: true
 
-      - name: Run unit tests
-        run: make test
-
-  interop:
-    name: interop
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: '~1.26'
-          cache: true
-
       - name: Ensure TUN device
         run: |
           sudo mkdir -p /dev/net
@@ -58,5 +41,5 @@ jobs:
           fi
           sudo chmod 0666 /dev/net/tun
 
-      - name: Run OpenVPN interop tests
-        run: make interop INTEROP_TEST_FLAGS="-run '^TestOpenVPNInterop'"
+      - name: Run tests
+        run: make test

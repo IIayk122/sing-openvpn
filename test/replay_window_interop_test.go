@@ -103,12 +103,13 @@ func droppingFrameDialContext(localPort int, target **droppingFrameConn) func(ct
 }
 
 func TestOpenVPNInteropTCPPacketIDGapRecovery(t *testing.T) {
+	t.Parallel()
 	env := requireInteropEnvironmentVersion(t, "2.6.14")
 	workspace := newInteropWorkspace(t)
 	t.Cleanup(func() {
 		dumpInteropLogs(t, workspace)
 	})
-	serverPort := reserveTCPPort(t)
+	serverPort := reserveInteropPort(t, "tcp")
 	serverConfiguration := fmt.Sprintf(`port %d
 proto tcp4-server
 dev tun
@@ -138,7 +139,7 @@ log %s
 		t.Fatalf("write replay server config: %v", err)
 	}
 	startInteropContainer(t, env.docker, dockerContainerOptions{
-		Name:         "sing-openvpn-replay-server-" + sanitizeDockerName(t.Name()),
+		Name:         "sing-openvpn-replay-server-" + uniqueDockerName(t.Name()),
 		Image:        env.image,
 		Command:      []string{"openvpn", "--config", filepath.ToSlash(filepath.Join(openVPNInteropRoot, "rendered", "replay-server.conf"))},
 		Binds:        []string{workspace.root + ":" + openVPNInteropRoot},
@@ -147,7 +148,7 @@ log %s
 	})
 	waitForLogLine(t, filepath.Join(workspace.logsDir, "replay-server.log"), "Initialization Sequence Completed", 20*time.Second)
 
-	clientPort := reserveTCPPort(t)
+	clientPort := reserveInteropPort(t, "tcp")
 	var droppingConn *droppingFrameConn
 	clientContext, cancelClient := context.WithTimeout(context.Background(), 60*time.Second)
 	client, err := openvpn.NewClient(openvpn.ClientOptions{
