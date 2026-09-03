@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"math/big"
 	"net"
 	"strconv"
@@ -227,6 +228,9 @@ func (c *Client) runSupervisor(ctx context.Context) {
 		if ctx.Err() != nil || c.isClosed() {
 			return
 		}
+		if !c.waitResumed(ctx) {
+			return
+		}
 		err := c.acquireSessionCredentials(ctx, !firstSession)
 		if err != nil {
 			if ctx.Err() != nil || c.isClosed() {
@@ -265,6 +269,10 @@ func (c *Client) runSupervisor(ctx context.Context) {
 			if ctx.Err() != nil || c.isClosed() {
 				return
 			}
+			if errors.Is(err, ErrClientSuspended) || c.isSuspended() {
+				backoff = clientReconnectInitialBackoff
+				continue
+			}
 			retryNow, replacementErr := c.interceptAuthChallenge(ctx, err)
 			if retryNow {
 				backoff = clientReconnectInitialBackoff
@@ -298,12 +306,19 @@ func (c *Client) runSupervisor(ctx context.Context) {
 		firstSession = false
 		backoff = clientReconnectInitialBackoff
 		c.clearPreviousAuthFailure()
+		if c.isSuspended() {
+			session.Fail(ErrClientSuspended)
+		}
 		sessionErr := <-session.Done()
 		stopSessionOnContextDone()
 		_ = session.Close()
 		c.clearCurrentSession(session)
 		if ctx.Err() != nil || c.isClosed() {
 			return
+		}
+		if errors.Is(sessionErr, ErrClientSuspended) || c.isSuspended() {
+			backoff = clientReconnectInitialBackoff
+			continue
 		}
 		if sessionErr == nil {
 			return
@@ -339,6 +354,7 @@ func (c *Client) closeSupervisorReadableState() {
 		c.lifecycle.currentSession = nil
 		c.stopDataReadsLocked()
 	}
+	c.signalStateChangedLocked()
 	c.lifecycle.access.Unlock()
 }
 
@@ -402,6 +418,7 @@ func (c *Client) setCurrentSession(ctx context.Context, session clientSession) b
 		return false
 	}
 	c.lifecycle.currentSession = session
+	c.signalStateChangedLocked()
 	c.lifecycle.access.Unlock()
 	return true
 }
@@ -411,13 +428,48 @@ func (c *Client) clearCurrentSession(session clientSession) {
 	if c.lifecycle.currentSession == session {
 		c.lifecycle.currentSession = nil
 	}
+	c.signalStateChangedLocked()
 	c.lifecycle.access.Unlock()
+}
+
+func (c *Client) signalStateChanged() {
+	c.lifecycle.access.Lock()
+	c.signalStateChangedLocked()
+	c.lifecycle.access.Unlock()
+}
+
+func (c *Client) signalStateChangedLocked() {
+	close(c.lifecycle.stateChanged)
+	c.lifecycle.stateChanged = make(chan struct{})
+}
+
+func (c *Client) isSuspended() bool {
+	c.lifecycle.access.Lock()
+	defer c.lifecycle.access.Unlock()
+	return c.lifecycle.suspended.Load()
+}
+
+func (c *Client) waitResumed(ctx context.Context) bool {
+	c.lifecycle.access.Lock()
+	if !c.lifecycle.suspended.Load() {
+		c.lifecycle.access.Unlock()
+		return true
+	}
+	resumed := c.lifecycle.resumed
+	c.lifecycle.access.Unlock()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-resumed:
+		return true
+	}
 }
 
 func (c *Client) setTerminalError(err error) {
 	c.lifecycle.access.Lock()
 	c.lifecycle.terminalError = err
 	c.stopDataReadsLocked()
+	c.signalStateChangedLocked()
 	c.lifecycle.access.Unlock()
 }
 
